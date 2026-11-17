@@ -13,6 +13,17 @@ import { type FileHandle, link, lstat, mkdir, open, readdir, realpath, rename, r
 import { resolve } from "node:path";
 import type { ArtifactMeta } from "../core/types.ts";
 import { ExclusiveFileLock } from "../platform/eventstore/fileLock.ts";
+import {
+  LOCK_DOMAIN_RECORD,
+  LOCK_DOMAIN_TOKEN,
+  type LockDomainRecord,
+  type LockDomainRestampInfo,
+  classifyLockDomainDrift,
+  lockDomainIntegrityError,
+  parseLockDomainRecord,
+  restampLockDomainRecord,
+  serializeLockDomainRecord,
+} from "./lockDomain.ts";
 
 type StoredArtifactMeta = ArtifactMeta & { sha256: string; immutable?: true };
 type ArtifactTransaction =
@@ -36,6 +47,12 @@ export interface ArtifactStoreHooks {
   afterLockDirectoryCreated?: () => void;
   afterLockBootstrapBound?: () => void;
   afterLockDomainPublished?: () => void;
+  /**
+   * A durable lock-domain record's device stamp was rewritten because the lock
+   * root moved to a new mount generation (same inode, ownership, mode and domain
+   * token). Audit hook only: continuity is already proven before it fires.
+   */
+  afterLockDomainRestamped?: (info: LockDomainRestampInfo) => void;
   /** Deterministic crash injection after the durable journal is published. */
   afterJournalCommitted?: (key: string) => Promise<void> | void;
   /** Deterministic delete crash injection after final-file removals are durable. */
@@ -86,9 +103,7 @@ function completeUtf8Prefix(bytes: Buffer): number {
   return bytes.length - lead < length ? lead : bytes.length;
 }
 const LOCK_BOOTSTRAP_BIND_WAIT_MS = 1_000;
-const LOCK_DOMAIN_RECORD = ".artifact-lock-domain.json";
 const LOCK_BOOTSTRAP_RECORD = ".artifact-lock-bootstrap.json";
-const LOCK_DOMAIN_TOKEN = ".domain-token";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function integrityError(message: string): Error {
@@ -227,11 +242,6 @@ interface OpenCategory {
 interface DirectoryIdentity {
   device: bigint;
   inode: bigint;
-}
-
-interface LockDomainRecord extends DirectoryIdentity {
-  version: 1;
-  token: string;
 }
 
 type LockBootstrapRecord =
@@ -630,8 +640,23 @@ export class ArtifactStore {
         if (!record) {
           if (!bootstrap) throw integrityError("artifact lock root bootstrap marker disappeared");
           if (bootstrap.phase !== "bound") throw integrityError("artifact lock root bootstrap was not bound");
-          if (bootstrap.device !== identity.dev || bootstrap.inode !== identity.ino) {
-            throw integrityError("artifact lock root bootstrap identity changed");
+          if (bootstrap.inode !== identity.ino) {
+            throw integrityError(
+              "artifact lock root bootstrap identity changed (the bound inode is not the lock directory)",
+            );
+          }
+          if (bootstrap.device !== identity.dev) {
+            // A bound marker written before a mount-generation change — the crash
+            // window that spans a reboot or a `/pie update` APFS volume rollover.
+            // Continuity is the token, which lives inside the directory, so only a
+            // directory carrying exactly this token is the same lock root. The
+            // durable record is then stamped from the live identity below.
+            const boundToken = await this.readLockDomainToken(handle, path).catch(() => undefined);
+            if (boundToken !== bootstrap.token) {
+              throw integrityError(
+                "artifact lock root bootstrap identity changed (the lock directory's domain token does not match the bound marker)",
+              );
+            }
           }
           if (createdIdentity && (createdIdentity.dev !== identity.dev || createdIdentity.ino !== identity.ino)) {
             throw integrityError("artifact lock root identity changed after creation");
@@ -652,7 +677,7 @@ export class ArtifactStore {
           });
           this.hooks.afterLockDomainPublished?.();
         }
-        await this.validateLockDomain(handle, record, identity);
+        record = await this.validateLockDomain(handle, record, identity, path, root);
         if (bootstrap) {
           if (
             bootstrap.token !== record.token ||
@@ -672,10 +697,13 @@ export class ArtifactStore {
           }
           if (bootstrap) await this.removeLockBootstrapRecord(root, bootstrap);
         }
+        // Re-resolve the name and require it to be the directory the durable
+        // record names. A different inode is a substitution; a different device
+        // is a mount generation, which validateLockDomain judges on the
+        // continuity of inode, ownership, mode and domain token before it
+        // re-stamps anything.
         const namedIdentity = await lstat(path, { bigint: true });
-        if (namedIdentity.dev !== record.device || namedIdentity.ino !== record.inode) {
-          throw integrityError("artifact lock root identity changed");
-        }
+        record = await this.validateLockDomain(handle, record, namedIdentity, path, root);
         this.lockDomain = record;
       } finally {
         await handle.close();
@@ -861,31 +889,10 @@ export class ArtifactStore {
     }
     try {
       const stat = await handle.stat();
-      if (!stat.isFile() || (stat.mode & 0o022) !== 0) throw integrityError("artifact lock domain record is unsafe");
-      let value: unknown;
-      try {
-        value = JSON.parse(await handle.readFile({ encoding: "utf8" }));
-      } catch {
-        throw integrityError("artifact lock domain record is corrupt");
+      if (!stat.isFile() || (stat.mode & 0o022) !== 0) {
+        throw lockDomainIntegrityError("artifact lock domain record is unsafe", "LOCK_DOMAIN_RECORD_UNSAFE");
       }
-      const candidate = value as Partial<{ version: number; token: string; device: string; inode: string }>;
-      if (
-        candidate.version !== 1 ||
-        typeof candidate.token !== "string" ||
-        !UUID.test(candidate.token) ||
-        typeof candidate.device !== "string" ||
-        !/^\d+$/.test(candidate.device) ||
-        typeof candidate.inode !== "string" ||
-        !/^\d+$/.test(candidate.inode)
-      ) {
-        throw integrityError("artifact lock domain record is corrupt");
-      }
-      return {
-        version: 1,
-        token: candidate.token,
-        device: BigInt(candidate.device),
-        inode: BigInt(candidate.inode),
-      };
+      return parseLockDomainRecord(await handle.readFile({ encoding: "utf8" }));
     } finally {
       await handle.close();
     }
@@ -957,15 +964,7 @@ export class ArtifactStore {
       0o600,
     );
     try {
-      await handle.writeFile(
-        `${JSON.stringify({
-          version: record.version,
-          token: record.token,
-          device: record.device.toString(),
-          inode: record.inode.toString(),
-        })}\n`,
-        "utf8",
-      );
+      await handle.writeFile(serializeLockDomainRecord(record), "utf8");
       await handle.sync();
     } finally {
       await handle.close();
@@ -984,19 +983,82 @@ export class ArtifactStore {
     }
   }
 
+  /**
+   * Assert that the lock root this store holds is the directory the durable
+   * record names, and return the record that now authoritatively describes this
+   * lock domain.
+   *
+   * Identity is the inode, the ownership/mode and above all the domain token —
+   * which lives *inside* the lock directory, so a copied or substituted tree
+   * cannot impersonate the store that created it. `device` is only a
+   * mount-generation stamp: when inode, ownership, mode and token all still prove
+   * continuity, a `st_dev` difference is a remount (APFS regenerates the volume
+   * generation on OS updates, restores and `/pie update`), and the record is
+   * re-stamped by compare-and-swap so a concurrent opener's stamp is never
+   * silently lost. Every other difference fails closed, and nothing is rewritten
+   * that continuity cannot prove.
+   *
+   * @param root the artifacts root descriptor; without it a mount generation
+   *   cannot be recorded, so the open fails closed instead of drifting.
+   */
   private async validateLockDomain(
     lockRoot: FileHandle,
     record: LockDomainRecord,
     suppliedIdentity?: { dev: bigint; ino: bigint },
     lockRootBase: string = resolve(this.rootReal, ".artifact-locks"),
-  ): Promise<void> {
+    root?: FileHandle,
+  ): Promise<LockDomainRecord> {
     const identity = suppliedIdentity ?? (await lockRoot.stat({ bigint: true }));
-    const token = await this.readLockDomainToken(lockRoot, lockRootBase).catch(() => {
-      throw integrityError("artifact lock root identity changed");
-    });
-    if (identity.dev !== record.device || identity.ino !== record.inode || token !== record.token) {
-      throw integrityError("artifact lock root identity changed");
+    assertTrustedDirectory(await lockRoot.stat(), "artifact lock root");
+    let candidate = record;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const token = await this.readLockDomainToken(lockRoot, lockRootBase).catch(() => undefined);
+      const drift = classifyLockDomainDrift({ record: candidate, identity, token });
+      if (drift.kind === "match") {
+        this.lockDomain = candidate;
+        return candidate;
+      }
+      if (drift.kind === "unsafe") throw lockDomainIntegrityError(drift.message, drift.code);
+      if (!root) {
+        throw lockDomainIntegrityError(
+          `artifact lock root identity changed (device ${drift.from} -> ${drift.to} is a mount generation this store cannot re-stamp)`,
+          "LOCK_DOMAIN_RESTAMP_CONFLICT",
+        );
+      }
+      const rootHandle = root;
+      const restamped = await restampLockDomainRecord({
+        dirPath: securePath(rootHandle.fd, this.rootReal),
+        expected: candidate,
+        device: identity.dev,
+        syncDir: () => rootHandle.sync(),
+      });
+      if (restamped) {
+        this.hooks.afterLockDomainRestamped?.({
+          from: drift.from,
+          to: drift.to,
+          inode: candidate.inode,
+          token: candidate.token,
+          reason: "mount_generation",
+        });
+        this.lockDomain = restamped;
+        return restamped;
+      }
+      // Another opener holds the authority now — it re-stamped first, or it
+      // published a different domain. Re-read and judge *that* record by the same
+      // rules; never assume our stamp landed.
+      const durable = await this.readLockDomainRecord(rootHandle);
+      if (!durable) {
+        throw lockDomainIntegrityError(
+          "artifact lock root identity changed (the lock domain record disappeared)",
+          "LOCK_DOMAIN_RECORD_MISSING",
+        );
+      }
+      candidate = durable;
     }
+    throw lockDomainIntegrityError(
+      `artifact lock root identity changed (device ${record.device} -> ${identity.dev} could not be re-stamped while another writer held the lock domain record)`,
+      "LOCK_DOMAIN_RESTAMP_CONFLICT",
+    );
   }
 
   private async openLockRoot(root: FileHandle): Promise<FileHandle> {
@@ -1013,16 +1075,29 @@ export class ArtifactStore {
       }
       const identity = await handle.stat({ bigint: true });
       const durable = await this.readLockDomainRecord(root);
-      if (
-        !durable ||
-        !this.lockDomain ||
-        durable.device !== this.lockDomain.device ||
-        durable.inode !== this.lockDomain.inode ||
-        durable.token !== this.lockDomain.token
-      ) {
-        throw integrityError("artifact lock root identity changed");
+      if (!durable) {
+        throw lockDomainIntegrityError(
+          "artifact lock root identity changed (the lock domain record disappeared)",
+          "LOCK_DOMAIN_RECORD_MISSING",
+        );
       }
-      await this.validateLockDomain(handle, durable, identity);
+      if (this.lockDomain && durable.token !== this.lockDomain.token) {
+        throw lockDomainIntegrityError(
+          "artifact lock root identity changed (the lock directory's domain token belongs to another store)",
+          "LOCK_DOMAIN_TOKEN_MISMATCH",
+        );
+      }
+      if (this.lockDomain && durable.inode !== this.lockDomain.inode) {
+        throw lockDomainIntegrityError(
+          `artifact lock root identity changed (inode ${this.lockDomain.inode} is not the lock directory at ${durable.inode}; a substituted directory is not the same store)`,
+          "LOCK_ROOT_INODE_CHANGED",
+        );
+      }
+      // Device-only drift against the in-memory stamp means another opener already
+      // re-stamped the record for a new mount generation. The durable record is the
+      // authority; validateLockDomain re-proves it against the live directory
+      // before this store adopts it.
+      this.lockDomain = await this.validateLockDomain(handle, durable, identity, undefined, root);
       this.hooks.afterLockDirectoryOpened?.();
       return handle;
     } catch (error) {

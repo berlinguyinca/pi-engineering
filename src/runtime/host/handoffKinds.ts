@@ -40,6 +40,25 @@ export interface HandoffEndpoint {
 export const HANDOFF_CAUSES = ["context_pressure", "quota_exhausted"] as const;
 export type HandoffCause = (typeof HANDOFF_CAUSES)[number];
 
+/** A reference to a checkpoint artifact plus its immutable sha256 hash. */
+export interface CheckpointArtifactRef {
+  ref: string;
+  sha256: string;
+}
+
+/**
+ * The immutable checkpoint reference set attached to a handoff record: which
+ * commit a successor resumes from, which commit that checkpoint was built on, and
+ * the artifact hashes it may verify against. Declared here (not in the builder
+ * module) because the durable record owns its own fields; `handoffCheckpointRefs`
+ * re-exports these names for its callers.
+ */
+export interface HandoffCheckpointRefs {
+  checkpointSha: string;
+  sourceSha: string;
+  readonly artifacts: readonly CheckpointArtifactRef[];
+}
+
 /** The durable, typed record of one handoff. */
 export interface HandoffRecord {
   id: string;
@@ -50,6 +69,11 @@ export interface HandoffRecord {
   successor?: HandoffEndpoint;
   /** Git commit SHA of the checkpoint handed over, when one exists. */
   checkpointSha?: string;
+  /**
+   * The full reference set behind `checkpointSha` (#458): the source commit and
+   * the artifact hashes. Optional so records written before it existed stay valid.
+   */
+  checkpointRefs?: HandoffCheckpointRefs;
   /** ISO timestamp of acknowledgement; required once acknowledged/committed. */
   ackAt?: string;
   /** ISO timestamp of creation. */
@@ -74,6 +98,9 @@ export interface HandoffRecord {
 }
 
 const CHECKPOINT_SHA_PATTERN = /^[0-9a-f]{7,64}$/;
+/** A checkpoint reference names a full commit sha, never an abbreviated one. */
+const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+const ARTIFACT_SHA_PATTERN = /^[0-9a-f]{64}$/;
 
 const REQUIRED_ACK_STATES: ReadonlySet<HandoffState> = new Set(["acknowledged", "committed"]);
 
@@ -157,6 +184,46 @@ export function validateHandoffRecord(
     }
   }
 
+  // The reference set is proof, so it is validated as proof: full commit shas, a
+  // sha256 per artifact, and agreement with the record's own checkpointSha. A
+  // record that disagreed with its own refs would hand a successor a verification
+  // that passes against the wrong checkpoint (#458).
+  if (obj.checkpointRefs !== undefined) {
+    const refs = obj.checkpointRefs;
+    if (typeof refs !== "object" || refs === null || Array.isArray(refs)) {
+      errors.push("checkpointRefs must be an object when present");
+    } else {
+      const r = refs as Record<string, unknown>;
+      if (typeof r.checkpointSha !== "string" || !FULL_COMMIT_SHA_PATTERN.test(r.checkpointSha)) {
+        errors.push("checkpointRefs.checkpointSha must be a 40-hex commit sha");
+      } else if (obj.checkpointSha === undefined) {
+        errors.push("checkpointRefs requires checkpointSha (the record must name what it proves)");
+      } else if (obj.checkpointSha !== r.checkpointSha) {
+        errors.push("checkpointRefs.checkpointSha must match checkpointSha");
+      }
+      if (typeof r.sourceSha !== "string" || !FULL_COMMIT_SHA_PATTERN.test(r.sourceSha)) {
+        errors.push("checkpointRefs.sourceSha must be a 40-hex commit sha");
+      }
+      if (!Array.isArray(r.artifacts)) {
+        errors.push("checkpointRefs.artifacts must be an array");
+      } else {
+        for (const [index, artifact] of r.artifacts.entries()) {
+          if (typeof artifact !== "object" || artifact === null) {
+            errors.push(`checkpointRefs.artifacts[${index}] must be an object`);
+            continue;
+          }
+          const a = artifact as Record<string, unknown>;
+          if (typeof a.ref !== "string" || a.ref.length === 0) {
+            errors.push(`checkpointRefs.artifacts[${index}].ref must be a non-empty string`);
+          }
+          if (typeof a.sha256 !== "string" || !ARTIFACT_SHA_PATTERN.test(a.sha256)) {
+            errors.push(`checkpointRefs.artifacts[${index}].sha256 must be a 64-hex sha256`);
+          }
+        }
+      }
+    }
+  }
+
   if (obj.ackAt !== undefined && !isIsoTimestamp(obj.ackAt)) {
     errors.push("ackAt must be an ISO-8601 timestamp when present");
   }
@@ -202,6 +269,16 @@ export function validateHandoffRecord(
   };
   if (obj.successor !== undefined) record.successor = obj.successor as HandoffEndpoint;
   if (obj.checkpointSha !== undefined) record.checkpointSha = obj.checkpointSha as string;
+  if (obj.checkpointRefs !== undefined) {
+    // A fresh deep copy: the caller's arrays and artifact objects are not
+    // reachable through the stored record.
+    const refs = obj.checkpointRefs as HandoffCheckpointRefs;
+    record.checkpointRefs = {
+      checkpointSha: refs.checkpointSha,
+      sourceSha: refs.sourceSha,
+      artifacts: refs.artifacts.map((artifact) => ({ ref: artifact.ref, sha256: artifact.sha256 })),
+    };
+  }
   if (obj.ackAt !== undefined) record.ackAt = obj.ackAt as string;
   if (obj.verifiedAt !== undefined) record.verifiedAt = obj.verifiedAt as string;
   if (obj.sourceFencedAt !== undefined) record.sourceFencedAt = obj.sourceFencedAt as string;

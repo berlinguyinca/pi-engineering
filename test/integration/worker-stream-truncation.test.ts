@@ -357,6 +357,82 @@ test("worker: resumes are capped; the next cut settles truncated_after_progress"
   assert.equal(requests, 5, "one tool turn, three resumed cuts, the fourth cut settles");
 });
 
+/**
+ * #96 — the gateway's cut can carry another failure's wording in the partial body:
+ * a stream cut in the middle of "404 model_not_found …" is still a CUT. The
+ * executor derives its gone-model marker from `classifyError` over the assistant
+ * error, and the truncated-stream rule is checked first. This pins that ordering:
+ * a false "that model is gone" would pull a healthy model out of routing for a TTL
+ * on the strength of text the model merely printed before the socket died.
+ */
+const cutWithUnavailableWording: Reply = (res) =>
+  sse(res, [chunk({ role: "assistant", content: "HTTP 404 model_not_found: probe-model is not served" })]);
+
+test("worker: a cut carrying unavailable-model wording keeps the truncated marker (#96)", async () => {
+  const requests = await withProbe(
+    [
+      bashMarker,
+      cutWithUnavailableWording,
+      cutWithUnavailableWording,
+      cutWithUnavailableWording,
+      cutWithUnavailableWording,
+    ],
+    async (executor, cwd) => {
+      const run = await bashRun(executor, cwd);
+      assert.equal(run.result.status, "failed");
+      assert.equal(run.error, "truncated_after_progress", `marker was ${run.error}: ${run.result.summary}`);
+      // The bash tool DID run before the cut, so the tree holds a partial edit
+      // (`side-effect.txt`). That is what a replacement model must be told (#96).
+      assert.match(String(run.executedActions), /bash/, "the executed action must travel with the result");
+      assert.match(String(run.executedActions), /MUST NOT be repeated/);
+    },
+  );
+  assert.equal(requests, 5, "one tool turn, three resumed cuts, the fourth cut settles");
+});
+
+// A provider that reports failure INSIDE the stream -- an SSE `error` frame, then
+// the socket closes with no finish_reason -- never becomes a message, so nothing
+// throws and the awaited model call hangs (#457). The first-token watchdog is the
+// only thing that can say so, but its configured window (15 min) is longer than a
+// whole worker run, so it could never fire before the wall clock did. Inside a
+// run's own silence deadline the window has to be reachable: the failure must be
+// the classified stream stall (which the retry ladder and takeover can act on),
+// not an opaque `timeout` that says nothing about why the model never answered.
+const errorFrameOnly: Reply = (res) =>
+  sse(res, [
+    `data: ${JSON.stringify({ error: { code: "model_not_found", message: "model_not_found: probe-model" } })}\n\n`,
+  ]);
+
+// Pinned as TODO, not as a passing assertion: the defect is real and measured, and
+// the two candidate remedies both cost something. Clamping the first-token window
+// to the run's silence deadline makes the failure classified
+// (`transient:network` + "model stream stalled: no data for 3750ms") but 5.5x
+// slower (8.8s -> 49s over 13 attempts), because a classified stall earns the
+// whole transient ladder. The fix that recovers the provider's own wording needs a
+// tap on the provider stream, which the executor does not own. See #457.
+test(
+  "worker: a stream that never yields a token fails as a stall, not an opaque timeout (#457)",
+  { todo: "#457: an SSE error frame leaves the run with no reason until the clock" },
+  async () => {
+    const requests = await withProbe(
+      Array.from({ length: 20 }, () => errorFrameOnly),
+      async (executor, cwd) => {
+        const started = Date.now();
+        const run = await executor.run({ role: "implementer", task: "t", tools: [], cwd, timeoutMs: 5_000 });
+        const elapsed = Date.now() - started;
+        assert.notEqual(run.error, "timeout", `run ended opaque with no reason: ${run.result.summary}`);
+        assert.match(String(run.error), /stall/, `error was ${String(run.error)}: ${run.result.summary}`);
+        assert.ok(
+          String(run.result.error ?? "").startsWith("transient"),
+          `failure must classify transient for the ladder, got ${String(run.result.error)}`,
+        );
+        assert.ok(elapsed < 5_000, `run burned its whole budget (${elapsed}ms)`);
+      },
+    );
+    assert.ok(requests <= 3, `a hung stream must not keep issuing requests (saw ${requests})`);
+  },
+);
+
 test("worker: the resume cap is configurable", async () => {
   const requests = await withProbe([bashMarker, cutMidMessage, cutMidMessage], async (_e, cwd) => {
     const executor = new PiWorkerExecutor({

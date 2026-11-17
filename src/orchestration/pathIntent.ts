@@ -91,7 +91,19 @@ const TRAILING_WINDOW = 2;
  * not leak", "to not use", "only if") describe the outcome of the change, not
  * an exclusion: their negation is dropped before any restriction test. A
  * path inside the clause keeps the negation (fail-safe).
+ *
+ * A result clause can also carry restriction vocabulary that is not a negation:
+ * "remove the extension from /T so it is excluded from every install" (#629).
+ * That clause states the mutation's own GOAL. Failing closed on the goal the
+ * request asked for leaves no writable workspace at all — the mission blocks,
+ * and no rewording of the verb saves it, only deleting the purpose does. So a
+ * result clause that names NO path has its restriction words dropped. A clause
+ * that names a path is left exactly as it was: there the restriction may
+ * genuinely be about that path, and taint stays taint.
  */
+const RESULT_CLAUSE_RUN = /\b(so(?: that)?|such that)\b([^.!?\uE000]*?)([.!?]|\s*$)/gi;
+const RESTRICTION_WORDS = new RegExp(STRONG.source, "gi");
+
 function neutralizeResultClauses(text: string): string {
   return text
     .replace(
@@ -99,7 +111,12 @@ function neutralizeResultClauses(text: string): string {
       "$1 $2",
     )
     .replace(/\bto\s+(?:not|never)\b/gi, "to")
-    .replace(/\b(so(?: that)?|such that|unless|if|whether)\s+((?:[^\s\uE000]+\s+){0,3}?)(\w+)n't\b/gi, "$1 $2$3");
+    .replace(/\b(so(?: that)?|such that|unless|if|whether)\s+((?:[^\s\uE000]+\s+){0,3}?)(\w+)n't\b/gi, "$1 $2$3")
+    .replace(RESULT_CLAUSE_RUN, (whole: string, intro: string, body: string, end: string) => {
+      if (!body.trim() || body.includes(OPEN)) return whole;
+      const stripped = body.replace(RESTRICTION_WORDS, " ");
+      return stripped === body ? whole : `${intro} ${stripped}${end}`;
+    });
 }
 const FROM_PATH = /\bfrom\s+["'`]?\uE000(\d+)\uE001/gi;
 const ONLY_PATH = /\bonly\s+(?:[^\s\uE000]+\s+){0,2}["'`]?\uE000(\d+)\uE001/gi;
