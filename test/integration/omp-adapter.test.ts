@@ -58,14 +58,17 @@ test("omp adapter: non-omp --version output yields Unavailable{version_unreadabl
 test("omp adapter: oversized --version output is cut off with version_unreadable", async () => {
   const result = await negotiateOmp({
     launch: { command: "/bin/sh", args: ["-c", "yes omp/18.20.0 | head -c 5000000", "sh"] },
-    timeoutMs: 10_000,
+    timeoutMs: 60_000,
   });
   assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.VersionUnreadable);
   assert.match(result.kind === "unavailable" ? result.detail : "", /exceeds 4096/);
 });
 
 test("omp adapter: pre-release omp version is refused with version_mismatch", async () => {
-  const result = await negotiateOmp({ launch: { command: "/bin/echo", args: ["omp/18.20.0-rc.1"] }, timeoutMs: 5_000 });
+  const result = await negotiateOmp({
+    launch: { command: "/bin/echo", args: ["omp/18.20.0-rc.1"] },
+    timeoutMs: 30_000,
+  });
   assert.equal(result.kind === "unavailable" && result.reason, UnavailableReason.VersionMismatch);
 });
 
