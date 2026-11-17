@@ -54,6 +54,7 @@ import type {
   Mission,
   MissionLease,
   MissionResumption,
+  MissionScopeSupplement,
   MissionStatus,
   MissionStop,
   OperatorModelPin,
@@ -159,6 +160,7 @@ export type OrchestrationEventType =
   | "execution.gate_evidence_published"
   | "mission.resumed"
   | "mission.stopped"
+  | "mission.scope_supplemented"
   | "mission.disk_suspend_marked"
   | "mission.disk_suspend_resolved"
   | "spec.stage"
@@ -247,6 +249,7 @@ const ORCHESTRATION_EVENT_TYPES: ReadonlySet<string> = new Set<OrchestrationEven
   "execution.gate_evidence_published",
   "mission.resumed",
   "mission.stopped",
+  "mission.scope_supplemented",
   "mission.disk_suspend_marked",
   "mission.disk_suspend_resolved",
   "spec.stage",
@@ -544,6 +547,7 @@ export class MissionStore {
   private readonly repositoryLeaseEpochs = new Map<string, RepositoryLease>();
   private readonly missionResumptions: MissionResumption[] = [];
   private readonly missionStops: MissionStop[] = [];
+  private readonly scopeSupplements: MissionScopeSupplement[] = [];
   /** (#416) disk-pressure suspend episodes, oldest first. */
   private readonly diskSuspendEpisodes: DiskSuspendEpisode[] = [];
   private readonly specRevisions = new Map<string, import("./specApproval.ts").MissionSpecRevision>();
@@ -1283,6 +1287,11 @@ export class MissionStore {
       case "mission.stopped": {
         const stop = e.payload.stop as MissionStop;
         if (stop) this.missionStops.push(copyMissionStop(stop));
+        break;
+      }
+      case "mission.scope_supplemented": {
+        const supplement = e.payload.supplement as MissionScopeSupplement | undefined;
+        if (supplement) this.scopeSupplements.push(structuredClone(supplement));
         break;
       }
       case "mission.disk_suspend_marked": {
@@ -4179,6 +4188,41 @@ export class MissionStore {
     this.missionStops.push(stop);
     this.emit("mission.stopped", missionId, { actor: "system", stop });
     return copyMissionStop(stop);
+  }
+
+  /**
+   * Record an operator's scope statement for a mission (#629). The mission's own
+   * `user_request` is never rewritten — see MissionScopeSupplement in types.ts.
+   */
+  recordScopeSupplement(missionId: string, text: string, actor = "operator"): MissionScopeSupplement {
+    const mission = this.missions.get(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    const statement = String(text).trim();
+    if (!statement) throw new Error("scope supplement must not be empty");
+    if (statement.length > 65_536) throw new Error("scope supplement exceeds 65536 characters");
+    const supplement: MissionScopeSupplement = { missionId, text: statement, at: new Date().toISOString() };
+    this.scopeSupplements.push(structuredClone(supplement));
+    this.emit("mission.scope_supplemented", missionId, { actor, supplement }, supplement.at);
+    return structuredClone(supplement);
+  }
+
+  listScopeSupplements(missionId: string): MissionScopeSupplement[] {
+    return this.scopeSupplements
+      .filter((entry) => entry.missionId === missionId)
+      .map((entry) => structuredClone(entry));
+  }
+
+  /**
+   * The request to resolve for a mission: what the user asked for, plus every
+   * scope statement the operator added afterwards. With none it returns exactly
+   * the mission's own request — nothing is invented.
+   */
+  effectiveRequest(missionId: string): string {
+    const mission = this.missions.get(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    const supplements = this.listScopeSupplements(missionId);
+    if (!supplements.length) return mission.user_request;
+    return [mission.user_request, ...supplements.map((entry) => entry.text)].join("\n\n");
   }
 
   /** Settle an exact durable mission snapshot once across every store sharing the backend. */

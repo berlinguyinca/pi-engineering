@@ -9,11 +9,24 @@ import { BlackholeManager } from "../../src/blackhole/BlackholeManager.ts";
 import type { MissionSnapshotFile } from "../../src/orchestration/missionSnapshot.ts";
 import { Orchestrator } from "../../src/orchestration/orchestrator.ts";
 import { MissionSupervisor, type SupervisorStatus } from "../../src/orchestration/supervisor.ts";
-import { EngineeringRuntime, type RuntimeMissionActivityEvent } from "../../src/runtime/EngineeringRuntime.ts";
+import {
+  EngineeringRuntime,
+  type RuntimeMissionActivityEvent,
+  SNAPSHOT_PUBLISH_INTERVAL_MS,
+} from "../../src/runtime/EngineeringRuntime.ts";
 import { FakeWorkerExecutor } from "../../src/workers/FakeWorkerExecutor.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Patience derived from the debounce actually in force, never from its default:
+ * `PI_ENG_SNAPSHOT_PUBLISH_MS` is an operator knob, and a host that tunes it up
+ * (the live instance runs 3000 ms) would otherwise see three false failures here
+ * and read them as a broken publisher.
+ */
+const snapshotWaitMs = SNAPSHOT_PUBLISH_INTERVAL_MS + 100;
+const snapshotPollAttempts = Math.ceil((SNAPSHOT_PUBLISH_INTERVAL_MS * 2 + 1_000) / 10);
 
 async function initGit(root: string): Promise<void> {
   await execFileAsync("git", ["init", "-q"], { cwd: root });
@@ -93,7 +106,7 @@ test("coalesces rapid internal snapshot requests into one publication", async ()
     schedule.call(runtime);
     schedule.call(runtime);
     assert.equal(publications, 0);
-    await new Promise((resolve) => setTimeout(resolve, 850));
+    await new Promise((resolve) => setTimeout(resolve, snapshotWaitMs));
     assert.equal(publications, 1);
     await runtime.close();
   } finally {
@@ -1174,7 +1187,7 @@ test("runtime republishes a serialized live snapshot on worker activity and hear
 
     const path = join(workDir, "orchestration-snapshot.json");
     let snapshot: MissionSnapshotFile | undefined;
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < snapshotPollAttempts; i++) {
       try {
         snapshot = JSON.parse(await readFile(path, "utf8")) as MissionSnapshotFile;
         if (snapshot.missions[0]?.observability?.currentActivity?.summary === "Finished tool: typecheck") break;
@@ -1223,7 +1236,7 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
     // The runtime retries transient snapshot writes with bounded backoff before
     // surfacing the diagnostic, so poll long enough to cover the in-call window
     // (the directory stays in place until after the diagnostic is asserted).
-    for (let i = 0; i < 300 && diagnostics.length === 0; i++) {
+    for (let i = 0; i < snapshotPollAttempts && diagnostics.length === 0; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(diagnostics.length, 1);
@@ -1238,7 +1251,7 @@ test("runtime diagnoses a failed snapshot write and retries on the next activity
       summary: "Retry update",
     });
     let snapshot: MissionSnapshotFile | undefined;
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < snapshotPollAttempts; i++) {
       try {
         snapshot = JSON.parse(await readFile(path, "utf8")) as MissionSnapshotFile;
         if (snapshot.missions[0]?.observability?.currentActivity?.summary === "Retry update") break;

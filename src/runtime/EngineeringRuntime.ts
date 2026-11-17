@@ -209,7 +209,14 @@ const SNAPSHOT_LOCK_BUSY_MAX_ATTEMPTS = 5;
 /** How long a publish waits for a live holder before skipping (#427). */
 const SNAPSHOT_LOCK_WAIT_MS = 250;
 /** Minimum interval between internal live-view snapshot publications; `PI_ENG_SNAPSHOT_PUBLISH_MS` retunes it. */
-const SNAPSHOT_PUBLISH_INTERVAL_MS = envTtlMs("PI_ENG_SNAPSHOT_PUBLISH_MS", 750, 50);
+/**
+ * How long a scheduled snapshot publication waits for coalescing. Exported because
+ * it is an OPERATOR knob (`PI_ENG_SNAPSHOT_PUBLISH_MS`) and the tests that observe
+ * publication have to wait for the value actually in force: a host tuned to 3000 ms
+ * makes a test that assumes the 750 ms default report "0 publications" and look
+ * like a regression in the publisher.
+ */
+export const SNAPSHOT_PUBLISH_INTERVAL_MS = envTtlMs("PI_ENG_SNAPSHOT_PUBLISH_MS", 750, 50);
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
@@ -2511,6 +2518,52 @@ export class EngineeringRuntime {
   async pauseMission(missionId: string): Promise<import("../orchestration/types.ts").Mission> {
     if (!this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
     return this.orchestrator.pauseMission(missionId);
+  }
+
+  /**
+   * #629: a mission whose workspace could not be resolved blocks before any task
+   * exists, and every automatic retry re-runs the same wording into the same
+   * refusal. The resolver's own error names the way out — state scope explicitly
+   * — but until now nothing accepted it, so the mission could only be cancelled
+   * and re-submitted.
+   *
+   * This is that door. The operator's scope statement is appended to the request
+   * the resolver reads, and only after it is PROVEN to resolve: a supplement that
+   * still fails is refused with the resolver's own message, so a mission never
+   * resumes into the same dead end with a newer timestamp. The original request
+   * stays in the durable log (`mission.created`); the amendment is its own record.
+   */
+  async supplementMissionScope(
+    missionId: string,
+    scopeText: string,
+  ): Promise<import("../orchestration/types.ts").Mission> {
+    if (!this.missionStore || !this.orchestrator) throw new Error("Orchestrator not initialized for this directory.");
+    const mission = this.missionStore.resolveMission(missionId);
+    if (!mission) throw new Error(`unknown mission ${missionId}`);
+    const statement = scopeText.trim();
+    if (!statement) throw new Error('scope statement is empty; state scope, e.g. "writable: /path/to/repo"');
+    if (mission.status !== "BLOCKED") {
+      throw new Error(
+        `mission ${missionId} is not blocked (${mission.status}); scope supplements are for blocked missions`,
+      );
+    }
+
+    const amended = `${mission.user_request}\n\n${statement}`;
+    // Prove the amendment resolves before touching anything. This is the same
+    // resolver the planning pass uses, run against the mission's own repository.
+    try {
+      await new WorkspaceManifestResolver().resolve(amended, mission.repository);
+    } catch (error) {
+      throw new Error(
+        `scope statement did not resolve; the mission stays blocked: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    // Recorded as its own durable amendment: the user's request stays immutable,
+    // and the recovery path resolves the request plus what the operator added.
+    this.missionStore.recordScopeSupplement(missionId, statement);
+    await this.missionStore.flush();
+    return this.resumeBlockedMission(missionId);
   }
 
   private recoveryBudgetExhausted(missionId: string, generation: number): boolean {
