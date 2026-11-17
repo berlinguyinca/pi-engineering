@@ -34,7 +34,10 @@ export interface HindsightSettings {
   harness: string;
   /** Pause automatic requests this long after a timeout or bad exit (ms). */
   failure_backoff_ms: number;
-  /** Pause automatic requests this long after a missing CLI or refused write (ms). */
+  /** Pause automatic requests this long after a server outage or refused write (ms).
+   * A missing CLI (spawn ENOENT) is its own `not-installed` class that re-probes on
+   * `failure_backoff_ms`, so a never-provisioned host is reported loudly instead of
+   * staying silently empty behind this longer pause. */
   unavailable_backoff_ms: number;
 }
 
@@ -51,6 +54,10 @@ export const DEFAULT_HINDSIGHT_SETTINGS: HindsightSettings = {
   enabled: true,
   cli: "herdr-memory",
   scopes: ["project"],
+  // Measured 2026-11-17 against the live service: cold single-scope recall 121 ms;
+  // project+global+infra with max-results 50 = 297-377 ms. The 5 s ceiling keeps
+  // headroom for the cold python+TLS+embedding spike observed on 2026-11-10 (4.06 s)
+  // so a slow-but-healthy client is not misclassified as a timeout (fail-open to []).
   timeout_ms: 5000,
   // Above the measured 0.4 s warm floor, below what a human will wait for a turn.
   automatic_recall_ms: 1_200,
