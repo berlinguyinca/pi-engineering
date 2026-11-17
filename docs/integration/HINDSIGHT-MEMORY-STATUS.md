@@ -136,3 +136,139 @@ Two things this settles and one it sharpens:
 
 - Nothing on the memory surface is unproven against the live service as of 2026-11-05.
   The write round-trip above closed the last gap.
+
+## Per-host provisioning runbook (2026-11-17)
+
+Engineering memory is provisioned **per host**, and nothing on the memory surface
+fails loudly when a host was never provisioned — a missing client degrades to "no
+memory". This runbook is the single place a pi-engineering operator provisions a new
+host end to end. It covers pi-engineering issue #673.
+
+### 0. What "provisioned" means
+
+A host is provisioned when all four are true:
+
+1. the `herdr-memory` CLI is installed **at the pinned revision**;
+2. `~/.config/herdr-memory/config.json` exists, names the correct endpoint, and sets
+   `tenant` to a **server** tenant name (see the trap below);
+3. the tenant credential files are readable and `0600` inside a `0700` parent, and no
+   `personal`-tenant key was ever exported to this host;
+4. the project/global/infra banks exist (recall is always the first call, and a
+   never-written bank 404s).
+
+After provisioning, `herdr-eng memory doctor` and `herdr-memory --harness pi status`
+should both pass (the only expected non-OK doctor line is `UNKNOWN fleet_update`, which
+is the unrelated herdr-memory#7).
+
+### 1. Install the pinned client
+
+The pin is owned by the herdr-engineering adapter (`memory_install.PINNED_REVISION` in
+the `herdr_engineering` package), and `herdr-eng memory doctor` enforces it. Install the
+CLI at that pin with `uv tool`:
+
+```sh
+uv tool install "herdr-memory @ git+ssh://git@github.com/berlinguyinca/herdr-memory.git@d48b334b6236065aa188a696dc6e9095b04ca761"
+```
+
+Verify:
+
+```sh
+command -v herdr-memory   # ~/.local/bin/herdr-memory (or a venv on PATH)
+herdr-eng memory doctor   # OK pin / OK package_revision / OK client_version
+```
+
+`herdr-eng memory install` installs the harness **adapters** only; it does **not** install
+the `herdr-memory` package itself. If `command -v herdr-memory` is empty, every adapter
+and the pi provider spawn a nonexistent binary and memory is silently never seen.
+
+### 2. Write the config (and the tenant trap)
+
+`~/.config/herdr-memory/config.json` (mode `0600`):
+
+```json
+{
+  "url": "https://memory.local.metabolomics.us",
+  "timeout_seconds": 10,
+  "default_project": "pi-engineering",
+  "projects": {
+    "pi-engineering": {
+      "tenant": "project",
+      "mission_scopes": true,
+      "paths": ["/home/<user>/pi-engineering"],
+      "credentials": { "pi": "~/.config/herdr-memory/tenants/project.key" }
+    }
+  },
+  "scopes": {
+    "global": { "credentials": { "pi": "~/.config/herdr-memory/tenants/global.key" } },
+    "infra":  { "credentials": { "pi": "~/.config/herdr-memory/tenants/infra.key" } }
+  }
+}
+```
+
+**The tenant trap.** The client (`client.py`) does `tenant = tenant or project`, and the
+namespace is `sha256([url, project, tenant])`. The deployment's server tenants are named
+`project` / `global` / `infra`. So a config with a `projects."pi-engineering"` entry and
+**no explicit `tenant`** authenticates against tenant `pi-engineering` — a name that does
+not exist server-side, and `doctor` will not catch it. `tenant` must always be set to the
+**server** tenant name (`project` here), never the project slug.
+
+### 3. Credential files
+
+Export each tenant's key into `~/.config/herdr-memory/tenants/` (the parent must be
+`0700` and each key `0600`):
+
+```sh
+herdr-eng fleet config memory export-key project --out ~/.config/herdr-memory/tenants/project.key
+herdr-eng fleet config memory export-key global  --out ~/.config/herdr-memory/tenants/global.key
+herdr-eng fleet config memory export-key infra   --out ~/.config/herdr-memory/tenants/infra.key
+chmod 0700 ~/.config/herdr-memory/tenants
+chmod 0600 ~/.config/herdr-memory/tenants/*.key
+```
+
+Never export a `personal`-tenant key to a project host, and never loosen permissions:
+`herdr-eng memory doctor` fails the `credential:…` checks if a key is group/other
+readable or its parent is world-accessible.
+
+### 4. Endpoint routing
+
+The fabric route **from `beast`** is `https://memory.local.metabolomics.us`. Do **not**
+use `memory.dev.lan` (port 8897) — that is `bender`-only and not routable from `beast`,
+and the client refuses plain `http://` off loopback. The fleet-config cache served to a
+host may have no `sections.memory` slice yet, so `discover_endpoint()` cannot supply the
+URL; set it explicitly in the config as above.
+
+### 5. Provision the banks (explicit PUT)
+
+Banks are created implicitly on first **write**; recall — always the first call — 404s on
+a never-written bank (berlinguyinca/herdr-memory#17). Create the four banks explicitly
+with the server credential before first recall:
+
+```
+PUT /v1/default/banks/pi-engineering-facts
+PUT /v1/default/banks/pi-engineering-summaries
+PUT /v1/default/banks/herdr-global
+PUT /v1/default/banks/herdr-infra
+```
+
+### 6. Verify
+
+```sh
+herdr-eng memory doctor                       # all OK except fleet_update
+herdr-memory --harness pi status              # {"healthy":true,"auth_ok":true,…}
+pi -p -e 'what did we record about <topic>?'  # memory block present, not "0 recalled"
+```
+
+### Failure taxonomy: `not-installed` vs `unavailable`
+
+`HindsightDurableMemory.call` classifies spawn failures instead of collapsing them:
+
+| Code | Meaning | Backoff |
+| --- | --- | --- |
+| `not-installed` | spawn `ENOENT`: the CLI is absent from this host (never provisioned) | `failure_backoff_ms` (60 s) — re-probes so a provisioning fix is noticed |
+| `unavailable` | config missing/invalid, or the service is unreachable | `unavailable_backoff_ms` (300 s) |
+| `timeout` | the subprocess was killed at its per-call deadline | `failure_backoff_ms`, capped at 10 s |
+| `exit` / `response` | non-zero exit, or unreadable output | `failure_backoff_ms` |
+
+A `not-installed` host stays fail-closed (reads degrade to "no memory"), but is reported
+loudly and re-probed on the short failure backoff rather than being hidden behind the
+300 s unavailable pause.

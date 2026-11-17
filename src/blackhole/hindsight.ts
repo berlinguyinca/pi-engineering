@@ -118,7 +118,7 @@ export const makeRunner =
 export const defaultRunner: HindsightRunner = makeRunner("pi");
 
 export class HindsightError extends Error {
-  readonly code: "unavailable" | "timeout" | "exit" | "response" | "rejected" | "queued";
+  readonly code: "unavailable" | "not-installed" | "timeout" | "exit" | "response" | "rejected" | "queued";
   constructor(code: HindsightError["code"]) {
     super(`Hindsight memory ${code}`);
     this.name = "HindsightError";
@@ -201,6 +201,10 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
       );
     } catch (error) {
       const e = error as { killed?: boolean; code?: unknown };
+      // ENOENT means the CLI does not exist on this host: a provisioning gap, not an
+      // outage. It is its own code so it is reported loudly instead of being folded
+      // into the "unavailable" 300 s backoff that hides a never-provisioned host.
+      if (e?.code === "ENOENT") throw new HindsightError("not-installed");
       throw new HindsightError(e?.killed || e?.code === "ETIMEDOUT" ? "timeout" : "unavailable");
     }
     if (res.exitCode !== 0) throw new HindsightError("exit");
@@ -345,6 +349,10 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     if (!safe) return [];
     if ((searchPausedUntil.get(this.cli) ?? 0) > Date.now()) return [];
     const pause = (code: string) => {
+      // A missing CLI (not-installed) is a per-host provisioning gap: re-probe it on
+      // the shorter failure backoff so a fix is noticed promptly, never the 300 s
+      // unavailable backoff that would keep memory silently empty. Still fail-closed:
+      // while paused (and on every failure) the search returns [] without spawning.
       const ms = code === "unavailable" ? this.unavailableBackoffMs : this.failureBackoffMs;
       searchPausedUntil.set(this.cli, Date.now() + ms);
     };
@@ -437,7 +445,9 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
     const result = await this.retain(record);
     if (result.outcome === "persisted") return;
     if (result.outcome === "queued_durable") throw new HindsightError("queued");
-    const transport = (["unavailable", "timeout", "exit", "response"] as const).find((c) => c === result.error);
+    const transport = (["unavailable", "not-installed", "timeout", "exit", "response"] as const).find(
+      (c) => c === result.error,
+    );
     throw new HindsightError(transport ?? "rejected");
   }
 

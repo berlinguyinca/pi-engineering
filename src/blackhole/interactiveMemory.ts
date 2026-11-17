@@ -64,7 +64,8 @@ const READINESS_LOOKUP_MS = 5_000;
 
 /** What each failure code says to the user, and what the turn notice names. */
 const FAILURE_MESSAGES: Record<string, string> = {
-  unavailable: "herdr-memory is unavailable (not installed, or its own config is missing)",
+  unavailable: "herdr-memory is unavailable (its own config is missing, or the service is unreachable)",
+  "not-installed": "herdr-memory is not installed on this host",
   timeout: "herdr-memory timed out",
   exit: "herdr-memory exited unsuccessfully",
   response: "herdr-memory returned unreadable output",
@@ -268,9 +269,12 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const handleError = (ctx: ExtensionContext, error: unknown, explicit = false): string => {
     const code = error instanceof HindsightError ? error.code : "unavailable";
     clearRecall(explicit);
-    // A missing CLI or a refused write will not fix itself between turns; a bad exit code
-    // might. A timeout says neither — the client was slow, not broken — so it retries at
-    // the first of the two backoffs instead of staying silent for a minute.
+    // A refused write or a server outage will not fix itself between turns, so those stay
+    // on the long unavailable backoff; a bad exit code might. A missing CLI (not-installed)
+    // is a per-host provisioning gap that a fix resolves, so it re-probes on the shorter
+    // failure backoff instead of being hidden behind the 300 s unavailable pause. A timeout
+    // says neither — the client was slow, not broken — so it retries at the first of the
+    // two backoffs instead of staying silent for a minute.
     const cfg = resolve();
     retryAfter =
       now() +
@@ -420,7 +424,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
             // Route it through the same path a throw takes, so the status, the
             // reply and the backoff all name what happened.
             throw new HindsightError(
-              (["unavailable", "timeout", "exit", "response"] as const).find((c) => c === result.error) ?? "rejected",
+              (["unavailable", "not-installed", "timeout", "exit", "response"] as const).find(
+                (c) => c === result.error,
+              ) ?? "rejected",
             );
           }
         } else {

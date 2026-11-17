@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { DurableMemoryRecord } from "../../src/blackhole/durableProvider.ts";
-import { HindsightDurableMemory, HindsightError } from "../../src/blackhole/hindsight.ts";
+import {
+  HindsightDurableMemory,
+  HindsightError,
+  type HindsightRunner,
+  resetHindsightBackoff,
+} from "../../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 import {
   legacyMemoryEnvNames,
@@ -31,18 +36,37 @@ test("probe rethrows when the CLI is missing, while recallAll stays best-effort"
   assert.deepEqual(await p.recallAll(), []);
   await assert.rejects(
     () => p.probe(),
-    (e) => e instanceof HindsightError && e.code === "unavailable",
+    (e) => e instanceof HindsightError && e.code === "not-installed",
   );
+});
+
+test("a missing CLI re-probes on the failure backoff, not the long unavailable pause", async () => {
+  resetHindsightBackoff();
+  let calls = 0;
+  const runner: HindsightRunner = () => {
+    calls++;
+    return Promise.reject(Object.assign(new Error("spawn /nonexistent/herdr-memory ENOENT"), { code: "ENOENT" }));
+  };
+  // failureBackoff is short, unavailableBackoff effectively infinite: only a not-installed
+  // classification that uses the failure backoff can re-probe within this window.
+  const p = new HindsightDurableMemory({ run: runner, failureBackoffMs: 120, unavailableBackoffMs: 300_000 });
+  await p.search("first query here"); // fails -> not-installed
+  assert.equal(calls, 1);
+  await p.search("second query here"); // still inside the failure backoff -> no re-probe
+  assert.equal(calls, 1, "no re-probe while paused on the failure backoff");
+  await new Promise((r) => setTimeout(r, 300)); // past failure backoff, far below the unavailable pause
+  await p.search("third query here");
+  assert.equal(calls, 2, "re-probes once the failure backoff has elapsed, not the 300 s unavailable one");
 });
 
 test("retain keeps the failure class for a missing CLI", async () => {
   const p = new HindsightDurableMemory({ cli: CLI });
   const r = await p.retain(rec);
   assert.equal(r.outcome, "rejected");
-  assert.equal(r.error, "unavailable");
+  assert.equal(r.error, "not-installed");
   await assert.rejects(
     () => p.store(rec),
-    (e) => e instanceof HindsightError && e.code === "unavailable",
+    (e) => e instanceof HindsightError && e.code === "not-installed",
   );
 });
 
@@ -77,21 +101,21 @@ test("/memory with a missing CLI reports failure, never 'verified'", async () =>
   await h.commands.get("memory").handler("", h.ctx);
   const all = h.notices.join("\n");
   assert.doesNotMatch(all, /verified/);
-  assert.match(all, /unavailable/);
-  assert.match(h.statuses.at(-1)!, /unavailable/);
+  assert.match(all, /not installed/);
+  assert.match(h.statuses.at(-1)!, /not installed/);
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("/remember with a missing CLI says unavailable, not refused", async () => {
+test("/remember with a missing CLI says not installed, not refused", async () => {
   const h = harness(true);
   await h.commands.get("remember").handler("hello", h.ctx);
   const all = h.notices.join("\n");
-  assert.match(all, /unavailable/);
+  assert.match(all, /not installed/);
   assert.doesNotMatch(all, /refused the write/);
   rmSync(h.dir, { recursive: true, force: true });
 });
 
-test("startup check with a missing CLI emits the unavailable warning headless", async () => {
+test("startup check with a missing CLI emits the not-installed warning headless", async () => {
   const h = harness(false);
   const seen: TelemetryNotice[] = [];
   setTelemetrySink((n) => seen.push(n));
@@ -100,7 +124,7 @@ test("startup check with a missing CLI emits the unavailable warning headless", 
   } finally {
     resetTelemetrySinks();
   }
-  assert.ok(seen.some((n) => n.key === "memory:unavailable"));
+  assert.ok(seen.some((n) => n.key === "memory:not-installed"));
   rmSync(h.dir, { recursive: true, force: true });
 });
 
@@ -246,9 +270,9 @@ test("default settings, CLI unreachable: starts, shows at most one notice, never
     assert.ok(Date.now() - started < 5000, "no hang beyond the automatic lookup cap");
     assert.equal(h.providers[0], "herdr-memory", "default settings (no YAML) enable memory with the default CLI name");
     assert.equal(h.notices.length, 1);
-    assert.match(h.notices[0]!, /unavailable/);
+    assert.match(h.notices[0]!, /not installed/);
     assert.match(h.notices[0]!, /enabled: false/);
-    assert.ok(h.statuses.some((t) => /unavailable/.test(t)));
+    assert.ok(h.statuses.some((t) => /not installed/.test(t)));
   } finally {
     rmSync(h.dir, { recursive: true, force: true });
   }
@@ -266,7 +290,7 @@ test("default settings, CLI unreachable, headless: one telemetry warning, no tra
     resetTelemetrySinks();
     rmSync(h.dir, { recursive: true, force: true });
   }
-  assert.equal(seen.filter((n) => n.key === "memory:unavailable").length, 1);
+  assert.equal(seen.filter((n) => n.key === "memory:not-installed").length, 1);
   assert.deepEqual(h.notices, []);
 });
 
