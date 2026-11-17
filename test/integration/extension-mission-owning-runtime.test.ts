@@ -9,7 +9,7 @@ import { realpathSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import extension, { settleWorkspaceActivity } from "../../extensions/index.ts";
 import { EngineeringRuntime } from "../../src/runtime/EngineeringRuntime.ts";
 import { RuntimeSession } from "../../src/runtime/isolation/RuntimeSession.ts";
@@ -84,9 +84,29 @@ async function touch(handlers: Map<string, Handler[]>, cwd: string, path: string
 
 describe("mission commands resolve the runtime that owns the mission", () => {
   const cleanup: string[] = [];
+  // A private control directory, as extension-session-control does: the shared
+  // default is not guaranteed to exist or be writable on a CI runner.
+  const previousControlDir = process.env.PI_ENGINEERING_CONTROL_DIR;
+  before(async () => {
+    const control = await mkdtemp(join(tmpdir(), "pi-eng-owning-control-"));
+    cleanup.push(control);
+    process.env.PI_ENGINEERING_CONTROL_DIR = control;
+  });
   after(async () => {
+    if (previousControlDir === undefined) delete process.env.PI_ENGINEERING_CONTROL_DIR;
+    else process.env.PI_ENGINEERING_CONTROL_DIR = previousControlDir;
     for (const dir of cleanup) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   });
+
+  // The control socket is published asynchronously after session_start.
+  async function listening(sessionId: string) {
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      const found = (await discoverSessions()).find((s) => s.sessionId === sessionId);
+      if (found || Date.now() > deadline) return found;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
 
   async function parentWithMission(prefix: string) {
     const workspace = realpathSync(await mkdtemp(join(tmpdir(), prefix)));
@@ -123,7 +143,7 @@ describe("mission commands resolve the runtime that owns the mission", () => {
       await touch(handlers, workspace, join(alpha, "README.md"));
       assert.equal(session.binding?.worktreePath, alpha, "session is bound to the nested worktree");
 
-      const control = (await discoverSessions()).find((s) => s.sessionId === sessionId);
+      const control = await listening(sessionId);
       assert.ok(control, "session control is listening");
       const status = await requestSession(control, { version: 1, op: "status" });
       assert.equal(status.ok, true);
