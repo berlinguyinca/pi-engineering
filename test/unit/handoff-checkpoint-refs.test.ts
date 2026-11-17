@@ -145,7 +145,11 @@ test("handoff checkpoint refs: inputs are not mutated and returned arrays/object
   assert.equal(firstArtifact?.ref, "artifact://checkpoint-1");
 });
 
-test("handoff checkpoint refs: attachCheckpointRefs sets checkpointSha, keeps other fields, returns new object", () => {
+// Updated for #458: attaching used to copy ONLY checkpointSha, so the whole
+// reference set (source sha + artifact hashes) was discarded one function before
+// it could be used. The record now carries it, so "keeps other fields" means
+// "keeps other fields AND adds the reference set".
+test("handoff checkpoint refs: attachCheckpointRefs sets checkpointSha, carries the refs, returns new object", () => {
   const record = baseRecord();
   const refs = { checkpointSha: SHA_A, sourceSha: SHA_B, artifacts: [{ ref: "artifact://c", sha256: H1 }] };
   const attached = attachCheckpointRefs(record, refs);
@@ -153,9 +157,10 @@ test("handoff checkpoint refs: attachCheckpointRefs sets checkpointSha, keeps ot
   assert.notStrictEqual(attached, record);
   assert.equal(attached.checkpointSha, SHA_A);
 
-  const { checkpointSha: _ignored, ...rest } = attached;
-  void _ignored;
-  assert.deepEqual(rest, record);
+  const { checkpointSha: _sha, checkpointRefs: attachedRefs, ...rest } = attached;
+  void _sha;
+  assert.deepEqual(rest, record, "no other field may change");
+  assert.deepEqual(attachedRefs, refs, "the whole set must reach the record (#458)");
 
   // The original record is not mutated.
   assert.equal(record.checkpointSha, undefined);

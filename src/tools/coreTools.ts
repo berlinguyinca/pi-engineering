@@ -40,6 +40,12 @@ export interface CoreServices {
    * the mission tool's `pause` action points at the slash command.
    */
   pauseMission?: (missionId: string) => Promise<Mission>;
+  /**
+   * State scope for a mission blocked because its workspace could not be
+   * resolved (#629), and resume it. Optional: without it the `scope` action
+   * points at the slash command.
+   */
+  supplementMissionScope?: (missionId: string, scopeText: string) => Promise<Mission>;
   /** Release a mission from its operator model pin (back to automatic routing). */
   clearMissionModelPin?: (missionId: string) => Promise<Mission>;
 }
@@ -592,12 +598,13 @@ export function buildCoreTools(
             Type.Literal("status"),
             Type.Literal("resume"),
             Type.Literal("pause"),
+            Type.Literal("scope"),
             Type.Literal("cancel"),
             Type.Literal("clear_pin"),
           ],
           {
             description:
-              "run (default) starts a mission from `request`; status/resume/pause/cancel/clear_pin act on `missionId`. pause stops one named mission and keeps its work (resume continues it); cancel ends one. clear_pin releases the mission from the operator's /model pin (automatic routing).",
+              'run (default) starts a mission from `request`; status/resume/pause/scope/cancel/clear_pin act on `missionId`. pause stops one named mission and keeps its work (resume continues it); cancel ends one. scope gives a mission that blocked on an unresolvable workspace the scope it never stated (`scopeText`, e.g. "writable: /path/to/repo") and resumes it — plain resume cannot help, because the same wording blocks again. clear_pin releases the mission from the operator\'s /model pin (automatic routing).',
           },
         ),
       ),
@@ -611,6 +618,12 @@ export function buildCoreTools(
         }),
       ),
       constraints: Type.Optional(Type.Array(Type.String({ description: "Constraints to apply" }))),
+      scopeText: Type.Optional(
+        Type.String({
+          description:
+            'Scope statement for action=scope, in the directive form the resolver itself names: "writable: /path/to/repo" and/or "read-only: /other/path".',
+        }),
+      ),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       // An id-taking action runs on the runtime that owns the mission, which is not
@@ -687,6 +700,27 @@ export function buildCoreTools(
         return describe(released, [
           "Operator pin released: the mission uses role pins and the router from its next dispatch.",
         ]);
+      }
+      if (action === "scope") {
+        const missionId = String(params.missionId ?? "").trim();
+        const scopeText = String(params.scopeText ?? "").trim();
+        if (!missionId || !scopeText)
+          return text('The scope action needs missionId and scopeText (e.g. "writable: /path/to/repo").');
+        if (!services.supplementMissionScope) {
+          return text(
+            `Stating scope is not available through the tool in this session. Ask the operator to run /mission scope ${missionId} ${scopeText}`,
+          );
+        }
+        // The runtime proves the statement resolves before it touches the mission,
+        // so a refusal here is the resolver's own advice, not a lost state.
+        const resumed = await services.supplementMissionScope(missionId, scopeText);
+        return text(
+          `Scope recorded for ${missionId}; the request now resolves, so the mission resumed (${resumed.status}).`,
+          {
+            missionId,
+            status: resumed.status,
+          },
+        );
       }
       if (action === "pause") {
         const missionId = String(params.missionId ?? "").trim();
