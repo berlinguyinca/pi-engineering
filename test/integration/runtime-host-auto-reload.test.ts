@@ -62,7 +62,12 @@ async function setup(opts: { autoReload?: boolean; safePointTimeoutMs?: number }
   return { key, source, ext, pi, host: ext.host as NonNullable<typeof ext.host>, b, commit };
 }
 
-async function until(cond: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+// The watcher polls every 25 ms here, so 10 s was already 400 polls; it still expired on a CI runner so
+// overloaded that one handover (git, module import, safe-point) took tens of seconds. The deadline only
+// bounds a genuine hang: a passing run returns as soon as the condition holds, so a large value costs nothing.
+const UNTIL_DEADLINE_MS = 180_000;
+
+async function until(cond: () => boolean, what: string, timeoutMs = UNTIL_DEADLINE_MS): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!cond()) {
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);

@@ -29,7 +29,10 @@ const alive = (pid: number): boolean => {
     return false;
   }
 };
-const until = async (cond: () => boolean, ms = 15_000): Promise<void> => {
+// A deadline only bounds a genuine hang: a passing run returns as soon as the condition holds. 15 s
+// expired on an overloaded CI runner (pipeline 282, two waits back to back failing at 30 s).
+const UNTIL_DEADLINE_MS = 180_000;
+const until = async (cond: () => boolean, ms = UNTIL_DEADLINE_MS): Promise<void> => {
   const end = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > end) throw new Error("timed out");
