@@ -209,7 +209,14 @@ const SNAPSHOT_LOCK_BUSY_MAX_ATTEMPTS = 5;
 /** How long a publish waits for a live holder before skipping (#427). */
 const SNAPSHOT_LOCK_WAIT_MS = 250;
 /** Minimum interval between internal live-view snapshot publications; `PI_ENG_SNAPSHOT_PUBLISH_MS` retunes it. */
-const SNAPSHOT_PUBLISH_INTERVAL_MS = envTtlMs("PI_ENG_SNAPSHOT_PUBLISH_MS", 750, 50);
+/**
+ * How long a scheduled snapshot publication waits for coalescing. Exported because
+ * it is an OPERATOR knob (`PI_ENG_SNAPSHOT_PUBLISH_MS`) and the tests that observe
+ * publication have to wait for the value actually in force: a host tuned to 3000 ms
+ * makes a test that assumes the 750 ms default report "0 publications" and look
+ * like a regression in the publisher.
+ */
+export const SNAPSHOT_PUBLISH_INTERVAL_MS = envTtlMs("PI_ENG_SNAPSHOT_PUBLISH_MS", 750, 50);
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));

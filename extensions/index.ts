@@ -2768,7 +2768,11 @@ ${RECOVERY_PROMPT}`;
       // Plain resume cannot help it: the same wording blocks again.
       const scope = /^scope\s+(MSN-\S+)\s+(\S[\s\S]*)$/i.exec(request);
       if (scope?.[1] && scope[2]) {
-        const rt = await openRuntime();
+        // The id is passed on purpose (#711): a session launched in a workspace
+        // parent — the exact case that produces a scope block — rebinds to a
+        // nested worktree, so the current binding is often NOT the runtime that
+        // owns this mission.
+        const rt = await openRuntime(scope[1]);
         if (!rt) return;
         try {
           const resumed = await rt.supplementMissionScope(scope[1], scope[2]);
