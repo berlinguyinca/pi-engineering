@@ -161,13 +161,14 @@ export function notInitializedText(subject: string, reason: string | null | unde
 }
 
 export function buildCoreTools(
-  resolve: (cwd: string) => CoreServices | null | Promise<CoreServices | null>,
+  resolve: (cwd: string, missionId?: string) => CoreServices | null | Promise<CoreServices | null>,
   options: {
     /** Why services are unavailable for a cwd (the real open failure), surfaced in tool results. */
     unavailableReason?: (cwd: string) => string | null | undefined;
   } = {},
 ): ToolDefinition[] {
-  const servicesFor = (cwd: string): Promise<CoreServices | null> => Promise.resolve(resolve(cwd));
+  const servicesFor = (cwd: string, missionId?: string): Promise<CoreServices | null> =>
+    Promise.resolve(resolve(cwd, missionId));
   const notInitialized = (subject: string, cwd: string): string =>
     notInitializedText(subject, options.unavailableReason?.(cwd));
   const ledgerRead = defineTool({
@@ -612,7 +613,10 @@ export function buildCoreTools(
       constraints: Type.Optional(Type.Array(Type.String({ description: "Constraints to apply" }))),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      const services = await servicesFor(ctx.cwd);
+      // An id-taking action runs on the runtime that owns the mission, which is not
+      // necessarily the one the session is bound to now.
+      const targetMissionId = String(params.missionId ?? "").trim();
+      const services = await servicesFor(ctx.cwd, targetMissionId || undefined);
       const text = (body: string, details: Record<string, unknown> = {}) => ({
         content: [{ type: "text" as const, text: body }],
         details,

@@ -300,6 +300,40 @@ async function getRuntime(ctx: ExtensionCommandContext, worker?: EngineeringRunt
   return getRuntimeByCwd(worker ? worker.cwd : runtimeCwd(ctx.cwd), ctx.model);
 }
 
+class AmbiguousMissionOwnerError extends Error {}
+
+/**
+ * The runtime that owns a mission. A session launched in a parent directory
+ * rebinds to a nested worktree, so the runtime of the CURRENT binding is not
+ * necessarily the one that created the mission. Custody wins; a runtime whose
+ * store merely holds the mission is the fallback; otherwise the current
+ * binding answers (and reports the id unknown itself). Two owners is refused:
+ * guessing would act on the wrong mission.
+ */
+async function runtimeForMission(
+  missionId: string | undefined,
+  current: () => Promise<EngineeringRuntime>,
+): Promise<EngineeringRuntime> {
+  if (!missionId) return current();
+  const refuse = (owners: EngineeringRuntime[]): never => {
+    throw new AmbiguousMissionOwnerError(
+      `mission ${missionId} is held by ${owners.length} open runtimes (${owners.map((r) => r.cwd).join(", ")}); refusing to guess which one to act on`,
+    );
+  };
+  const owners: EngineeringRuntime[] = [];
+  for (const { runtime } of runtimes.values()) {
+    if ((await runtime.maintenanceOwnedMissionIds()).includes(missionId)) owners.push(runtime);
+  }
+  if (owners.length > 1) return refuse(owners);
+  if (owners[0]) return owners[0];
+  const holders = [...runtimes.values()].map((e) => e.runtime).filter((r) => r.missionStore?.getMission(missionId));
+  if (holders.length === 0) return current();
+  const active = await current().catch(() => null);
+  if (active && holders.includes(active)) return active;
+  if (holders.length > 1) return refuse(holders);
+  return holders[0]!;
+}
+
 /**
  * The directory whose runtime serves a launch cwd. After a parent-directory
  * launch rebinds to a nested worktree (spec §2/§3), the launch cwd resolves to
@@ -737,13 +771,14 @@ const runtimeOpenFailures = new Map<string, string>();
  * Resolve tools to the runtime for the calling cwd, opening it lazily so the
  * semantic tools work in the interactive session without a prior command.
  */
-async function resolveServices(cwd: string): Promise<CoreServices | null> {
+async function resolveServices(cwd: string, missionId?: string): Promise<CoreServices | null> {
   let rt: EngineeringRuntime;
   const effective = runtimeCwd(cwd);
   try {
-    rt = await getRuntimeByCwd(effective);
+    rt = await runtimeForMission(missionId, () => getRuntimeByCwd(effective));
     runtimeOpenFailures.delete(cwd);
   } catch (error) {
+    if (error instanceof AmbiguousMissionOwnerError) throw error;
     // Concurrency is not a failure mode any more (per-session event streams,
     // automatic stale-owner recovery), so what reaches here is a genuine
     // filesystem/permission problem. Surface the REAL reason — in the tool
@@ -2711,10 +2746,14 @@ ${RECOVERY_PROMPT}`;
       }
       // A runtime that did not open (e.g. an ArtifactStore integrity refusal)
       // is reported with its reason instead of escaping the handler.
-      const openRuntime = async (): Promise<EngineeringRuntime | null> => {
+      const openRuntime = async (missionId?: string): Promise<EngineeringRuntime | null> => {
         try {
-          return await getRuntime(ctx);
+          return await runtimeForMission(missionId, () => getRuntime(ctx));
         } catch (error) {
+          if (error instanceof AmbiguousMissionOwnerError) {
+            ctx.ui.notify(error.message, "error");
+            return null;
+          }
           ctx.ui.notify(
             notInitializedText("Orchestrator", error instanceof Error ? error.message : String(error)),
             "error",
@@ -2724,7 +2763,7 @@ ${RECOVERY_PROMPT}`;
       };
       const cancel = /^cancel\s+(MSN-\S+)\s*$/i.exec(request);
       if (cancel?.[1]) {
-        const rt = await openRuntime();
+        const rt = await openRuntime(cancel[1]);
         if (!rt) return;
         try {
           const canceled = await rt.cancelMission(cancel[1]);
@@ -2739,7 +2778,7 @@ ${RECOVERY_PROMPT}`;
       // is rarely the one on screen.
       const pause = /^pause\s+(MSN-\S+)\s*$/i.exec(request);
       if (pause?.[1]) {
-        const rt = await openRuntime();
+        const rt = await openRuntime(pause[1]);
         if (!rt) return;
         try {
           const paused = await rt.pauseMission(pause[1]);
@@ -2758,7 +2797,7 @@ ${RECOVERY_PROMPT}`;
         return;
       }
       if (inspect?.[1]) {
-        const rt = await openRuntime();
+        const rt = await openRuntime(inspect[1]);
         if (!rt) return;
         const projection = rt.missionObservability?.projection(inspect[1]);
         ctx.ui.notify(
@@ -2771,7 +2810,7 @@ ${RECOVERY_PROMPT}`;
       }
       const why = /^why\s+(\S+)\s*$/i.exec(request);
       if (why?.[1]) {
-        const rt = await openRuntime();
+        const rt = await openRuntime(why[1]);
         if (!rt?.missionStore) return;
         try {
           ctx.ui.notify(formatMissionWhy(explainMission(rt.missionStore, why[1])), "info");
@@ -2823,7 +2862,7 @@ ${RECOVERY_PROMPT}`;
           );
         }
       }
-      const rt = await openRuntime();
+      const rt = await openRuntime(resume?.[1]);
       if (!rt) return;
       if (!rt.orchestrator) {
         ctx.ui.notify(notInitializedText("Orchestrator", undefined), "error");
