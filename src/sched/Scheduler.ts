@@ -51,6 +51,15 @@ export class Scheduler {
   private readonly concurrency: number;
   private readonly queue: QueueItem<unknown>[] = [];
   private active = 0;
+  /**
+   * Highest number of tasks this limiter ever ran at once.
+   *
+   * Admission happens synchronously inside `pump()`, so this is a fact about the limiter rather than about when
+   * the host happened to run two task bodies. Callers that need to prove overlap -- the planner/worker DAG, and
+   * tests that must not go red on a loaded CI agent (#689) -- read this instead of counting entries in their own
+   * callbacks and comparing wall clocks.
+   */
+  maxInFlight = 0;
   private readonly pending: Promise<unknown>[] = [];
   /** Weighted-deficit round-robin state: credits per source (persistent). */
   private readonly deficit = new Map<string, number>();
@@ -122,6 +131,7 @@ export class Scheduler {
       const item = this.pickFair();
       if (!item) break;
       this.active++;
+      if (this.active > this.maxInFlight) this.maxInFlight = this.active;
       const p = (async () => {
         const start = Date.now();
         try {

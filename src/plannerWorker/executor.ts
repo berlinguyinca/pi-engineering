@@ -246,6 +246,8 @@ export class PlannerWorkerExecutor {
   private readonly opts: PlannerWorkerOptions;
   private readonly activity = new PlannerActivity();
   private lastActivityPersist = 0;
+  /** The DAG driver's limiter, kept so its own concurrency record is readable from outside (#689). */
+  private dagScheduler: Scheduler | undefined;
 
   liveSnapshot(): PlannerLiveSnapshot {
     return {
@@ -309,6 +311,17 @@ export class PlannerWorkerExecutor {
   /** True after exclusive ownership and, for resumes, persisted-state validation. */
   get hasStartedExecution(): boolean {
     return this.started > 0;
+  }
+
+  /**
+   * Highest number of worker contracts this run ever had admitted at once, from the limiter's own record (#689).
+   *
+   * 0 before a run starts. This is the answer to "did independent contracts actually run in parallel" that does
+   * not depend on host scheduling: admission is a synchronous decision inside the limiter, while counting entries
+   * inside a worker callback and comparing wall clocks goes red on a loaded CI agent.
+   */
+  get peakWorkerConcurrency(): number {
+    return this.dagScheduler?.maxInFlight ?? 0;
   }
 
   async run(brief: MissionBrief): Promise<PlannerWorkerReport> {
@@ -571,6 +584,7 @@ export class PlannerWorkerExecutor {
 
   private async executeDag(): Promise<void> {
     const scheduler = new Scheduler({ concurrency: Math.max(1, this.opts.concurrency ?? 2) });
+    this.dagScheduler = scheduler;
     const running = new Map<string, Promise<void>>();
     for (;;) {
       if (this.opts.signal?.aborted) {

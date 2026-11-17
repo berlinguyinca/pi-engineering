@@ -22,8 +22,24 @@ test("scheduler: limits concurrency (backpressure)", async () => {
     },
   }));
   const out = await s.scheduleAll(tasks);
-  assert.equal(peak, 2);
+  // #689: the claim is made on the limiter's own record. `pump()` admits tasks synchronously up to the limit,
+  // so `maxInFlight` does not depend on when the host happened to run two bodies. The body counter is kept as
+  // an upper bound only -- asking it to reach 2 is asking the scheduler to be lucky.
+  assert.equal(s.maxInFlight, 2);
+  assert.ok(peak <= 2, `body-level concurrency exceeded the limit: ${peak}`);
   assert.equal(out.length, 6);
+});
+
+test("scheduler: maxInFlight records the highest number of tasks it ever ran at once (#689)", async () => {
+  const six = () => Array.from({ length: 6 }, (_, i) => ({ id: `t${i}`, source: "a", run: async () => delay(5) }));
+  const wide = new Scheduler({ concurrency: 3 });
+  await wide.scheduleAll(six());
+  assert.equal(wide.maxInFlight, 3, "three admitted at a time has to be readable without measuring wall clock");
+  const serial = new Scheduler({ concurrency: 1 });
+  await serial.scheduleAll(six());
+  assert.equal(serial.maxInFlight, 1, "a serial limiter must not claim overlap it never had");
+  assert.equal(wide.inFlight, 0);
+  assert.equal(wide.queued, 0);
 });
 
 test("scheduler: fairness — a heavy source cannot starve a light source", async () => {
