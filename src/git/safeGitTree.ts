@@ -8,7 +8,24 @@
  * Git does not defend against that. So: every entry that matters is looked at with `lstat` semantics first, and a
  * symbolic link, a socket, a FIFO or a device where a regular file or directory belongs refuses the call.
  *
- * Only `readdir` entry types are used (no per-file stat), so the cost is one directory read per directory.
+ * Only `readdir` entry types are used (no per-file stat) except for the hard-link check, so the cost is one
+ * directory read per directory plus one `lstat` per regular file.
+ *
+ * Do not memoize this. A hotpatch applied in place to installed releases keyed the verdict on the mtimes of a
+ * fixed list of directories (#679) and was fail-open: planting `refs/heads/x/target` bumps `refs/heads`, not
+ * `refs`, so a cached "clean" verdict outlives an entry this scan refuses. A signature sound enough to cover what
+ * the verdict is derived from -- entry names, entry types, and `nlink` of every regular file, because a hard link
+ * can be planted from outside the tree without touching any entry inside it -- costs at least as many syscalls as
+ * the walk it replaces. Measured on a synthetic repository, best of 20 runs:
+ *
+ * | tree              | this scan | sound signature | the hotpatch's 7-mtime signature |
+ * | ----------------- | --------- | --------------- | -------------------------------- |
+ * | 2 000 loose refs  | 34 us     | 36 us           | ~0 us (unsound)                  |
+ * | 20 000 loose refs | 355 us    | 379 us          | ~0 us (unsound)                  |
+ *
+ * 34 us is below the noise of the git process `safeGit` is about to spawn, so the only way to make the memo pay
+ * is to make it unsound. The counterexample is pinned in `test/unit/git-tree-scan-signature.test.ts`, under every
+ * value of `PI_ENG_TREE_SCAN_MEMO`, so a memo has to be correct to pass rather than merely fast.
  */
 import { type Dirent, lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
