@@ -8,20 +8,11 @@
  * arrays and objects are always fresh.
  */
 
-import type { HandoffRecord } from "./handoffKinds.ts";
+import type { HandoffCheckpointRefs, HandoffRecord } from "./handoffKinds.ts";
 
-/** A reference to a checkpoint artifact plus its immutable sha256 hash. */
-export interface CheckpointArtifactRef {
-  ref: string;
-  sha256: string;
-}
-
-/** The immutable checkpoint reference set attached to a handoff record. */
-export interface HandoffCheckpointRefs {
-  checkpointSha: string;
-  sourceSha: string;
-  artifacts: readonly CheckpointArtifactRef[];
-}
+// The record owns these shapes; they are re-exported so callers that imported
+// them from this module keep working (#458).
+export type { CheckpointArtifactRef, HandoffCheckpointRefs } from "./handoffKinds.ts";
 
 /** Inputs for building a checkpoint reference set. */
 export interface CheckpointRefsInput {
@@ -104,7 +95,21 @@ export function buildCheckpointRefs(input: CheckpointRefsInput): CheckpointRefsR
 /**
  * Attach an immutable checkpoint reference set to a handoff record. Returns a new
  * object; the input record is never mutated.
+ *
+ * The WHOLE set rides on the record, not just the commit sha (#458): a successor
+ * that sees only `checkpointSha` knows which commit it resumes from but cannot
+ * prove which artifacts it was built from, and the hashes A1 computed were
+ * discarded one function before they could be used. `checkpointSha` is still set
+ * for readers that only ever looked at it.
  */
 export function attachCheckpointRefs(record: HandoffRecord, refs: HandoffCheckpointRefs): HandoffRecord {
-  return { ...record, checkpointSha: refs.checkpointSha };
+  return {
+    ...record,
+    checkpointSha: refs.checkpointSha,
+    checkpointRefs: {
+      checkpointSha: refs.checkpointSha,
+      sourceSha: refs.sourceSha,
+      artifacts: refs.artifacts.map((artifact) => ({ ref: artifact.ref, sha256: artifact.sha256 })),
+    },
+  };
 }

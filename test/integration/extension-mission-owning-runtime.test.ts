@@ -169,6 +169,44 @@ describe("mission commands resolve the runtime that owns the mission", () => {
     }
   });
 
+  it("routes a scope supplement to the runtime that owns the mission", async () => {
+    // #629's door is reached from exactly this shape — a mission blocked because
+    // the launch directory was a workspace PARENT — so a scope command that
+    // resolved the CURRENT binding would answer `unknown mission` on the very
+    // missions it exists to rescue.
+    const { workspace, alpha, handlers, commands, tools, mission, writer } = await parentWithMission("pi-eng-scope-");
+    const { ctx, notices } = ctxFor(workspace);
+    await touch(handlers, workspace, join(alpha, "README.md"));
+    try {
+      await commands.get("mission")!.handler(`scope ${mission.mission_id} writable: ${alpha}`, ctx);
+      const text = notices.at(-1)?.text ?? "";
+      assert.doesNotMatch(text, /unknown mission/i, "the command reached the runtime that owns the mission");
+      assert.match(text, /is not blocked/, "refused for a real reason, by the owner");
+      assert.equal(
+        writer.missionStore!.listScopeSupplements(mission.mission_id).length,
+        0,
+        "a refusal records nothing",
+      );
+
+      await assert.rejects(
+        tools
+          .get("mission")!
+          .execute(
+            "2",
+            { action: "scope", missionId: mission.mission_id, scopeText: `writable: ${alpha}` },
+            undefined,
+            undefined,
+            ctx,
+          ),
+        /is not blocked/,
+        "the tool resolves the owner the same way",
+      );
+    } finally {
+      for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
+      await writer.close();
+    }
+  });
+
   it("refuses to guess when two open runtimes both own the mission id", async () => {
     const { workspace, alpha, handlers, commands, tools, mission, writer } = await parentWithMission("pi-eng-ambig-");
     const { ctx, notices } = ctxFor(workspace);

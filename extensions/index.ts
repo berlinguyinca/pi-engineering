@@ -807,6 +807,8 @@ async function resolveServices(cwd: string, missionId?: string): Promise<CoreSer
     resumeMission: (id, s) => rt.resumeBlockedMission(id, s, "model"),
     cancelMission: (id) => rt.cancelMission(id),
     pauseMission: (id) => rt.pauseMission(id),
+    // #629: state the scope a blocked-on-scope mission never had, then resume it.
+    supplementMissionScope: (id, scopeText) => rt.supplementMissionScope(id, scopeText),
     clearMissionModelPin: (id) => rt.clearMissionModelPin(id),
     // A rebound parent launch targets the bound worktree by default.
     ...(effective !== cwd ? { repositoryRoot: rt.git?.root ?? effective } : {}),
@@ -2761,6 +2763,28 @@ ${RECOVERY_PROMPT}`;
           return null;
         }
       };
+      // #629: `/mission scope MSN-abc writable: /path/to/repo` — the recovery door
+      // for a mission that blocked because its workspace could not be resolved.
+      // Plain resume cannot help it: the same wording blocks again.
+      const scope = /^scope\s+(MSN-\S+)\s+(\S[\s\S]*)$/i.exec(request);
+      if (scope?.[1] && scope[2]) {
+        // The id is passed on purpose (#711): a session launched in a workspace
+        // parent — the exact case that produces a scope block — rebinds to a
+        // nested worktree, so the current binding is often NOT the runtime that
+        // owns this mission.
+        const rt = await openRuntime(scope[1]);
+        if (!rt) return;
+        try {
+          const resumed = await rt.supplementMissionScope(scope[1], scope[2]);
+          ctx.ui.notify(
+            `Mission ${resumed.mission_id} — scope recorded, request resolves, status ${resumed.status}`,
+            "info",
+          );
+        } catch (error) {
+          ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        }
+        return;
+      }
       const cancel = /^cancel\s+(MSN-\S+)\s*$/i.exec(request);
       if (cancel?.[1]) {
         const rt = await openRuntime(cancel[1]);

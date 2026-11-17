@@ -15,6 +15,7 @@ import { DEFAULT_GATEWAY_RESILIENCE, type GatewayResilienceConfig } from "../../
 import type { ProbeResult } from "../../src/resilience/probe.ts";
 import { UnavailableModels, createRouteModel } from "../../src/runtime/modelRouting.ts";
 import type { WorkerExecutor, WorkerRun } from "../../src/workers/WorkerExecutor.ts";
+import { realRouter } from "../support/realRouter.ts";
 
 const HOUR = 3_600_000;
 
@@ -286,7 +287,7 @@ describe("orchestrator: a task that fails terminally inside the resilience windo
 describe("orchestrator: another model takes over when the mission's model cannot serve", () => {
   const A = { provider: "gw", id: "model-a" };
   const B = { provider: "gw", id: "model-b" };
-  const takeoverAgent = (failModelA: () => WorkerRun, onActivity: (summary: string) => void) => {
+  const takeoverAgent = async (failModelA: () => WorkerRun, onActivity: (summary: string) => void) => {
     const unavailable = new UnavailableModels();
     const models: string[] = [];
     const worker: WorkerExecutor = {
@@ -304,12 +305,11 @@ describe("orchestrator: another model takes over when the mission's model cannot
       git: null,
       cwd: process.cwd(),
       routeModel: createRouteModel({
-        router: {
-          route: async (_role, query) => {
-            const excluded = new Set((query?.exclude ?? []).map((m) => `${m.provider}/${m.id}`));
-            return [A, B].find((m) => !excluded.has(`${m.provider}/${m.id}`));
-          },
-        },
+        // #96: the production router over this inventory, not a hand-written one
+        // that returns the first model not yet tried. Capability ranking, provider
+        // ordering and the exclusion set are the thing under test here — a takeover
+        // that only works against a router no runtime ever builds proves nothing.
+        router: await realRouter([A, B]),
         unavailable,
       }),
       onModelUnavailable: (route) => unavailable.mark(route),
@@ -330,7 +330,7 @@ describe("orchestrator: another model takes over when the mission's model cannot
 
   it("a model that leaves the gateway (model_not_found) is taken over by the next eligible model", async () => {
     const activity: string[] = [];
-    const agent = takeoverAgent(
+    const agent = await takeoverAgent(
       () => failedRun('Worker failed: 404 {"code":"model_not_found"}', "transient:model_unavailable"),
       (summary) => activity.push(summary),
     );
@@ -353,7 +353,7 @@ describe("orchestrator: another model takes over when the mission's model cannot
 
   it("a model with no capacity is taken over by the next eligible model and completes", async () => {
     const activity: string[] = [];
-    const agent = takeoverAgent(
+    const agent = await takeoverAgent(
       () => failedRun("capacity_unavailable", "transient:server_unavailable"),
       (summary) => activity.push(summary),
     );
