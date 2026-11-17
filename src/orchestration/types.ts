@@ -702,6 +702,20 @@ export interface MissionResumption {
   origin?: "operator" | "model" | "automatic";
 }
 
+/**
+ * An operator's later scope statement for a mission whose workspace could not be
+ * resolved (#629). Recorded separately rather than written into `user_request`:
+ * the request the user submitted is immutable through the update path (a model
+ * must not rewrite the mandate it was given), and provenance matters — this is
+ * what a human added after the machine said it could not proceed.
+ */
+export interface MissionScopeSupplement {
+  missionId: EntityId;
+  /** The statement in the resolver's own directive form, e.g. "writable: /repo". */
+  text: string;
+  at: string;
+}
+
 export interface MissionStop {
   missionId: EntityId;
   reason: string;

@@ -1208,7 +1208,7 @@ export class Orchestrator {
         try {
           const current = this.store.getWorkspaceManifest(missionId);
           const resolved = this.repositoryRegistry
-            ? await this.workspaceResolver!.resolve(mission.user_request, this.launchCwd)
+            ? await this.workspaceResolver!.resolve(this.store.effectiveRequest(missionId), this.launchCwd)
             : await this.workspaceResolver!.resolveRepository(mission.repository);
           this.assertRecoveryGeneration(missionId, expectedResumptionGeneration);
           const rebuilt = createWorkspaceManifest(resolved, missionId, (current?.generation ?? 0) + 1);
@@ -2544,6 +2544,16 @@ export class Orchestrator {
           classifiedAt: new Date().toISOString(),
         });
         this.store.transitionMission(mission.mission_id, "BLOCKED");
+        // #629: a mission may only be resumed from a durable stop, and this block
+        // wrote none — so even an operator who fixed the wording had nothing to
+        // resume from. Record the stop with the condition that actually clears it.
+        this.store.stopMission(mission.mission_id, {
+          reason: `workspace scope could not be resolved: ${workspaceError.message}`,
+          preservedWork: [],
+          attemptedRecoveries: [],
+          resumeCondition:
+            "operator states scope explicitly (/mission scope <id> writable: /path/to/repo) and the request resolves",
+        });
         const blocked = this.store.getMission(mission.mission_id)!;
         return {
           mission: blocked,
