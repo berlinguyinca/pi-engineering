@@ -25,7 +25,7 @@ import { emitTelemetry } from "../../telemetry/sink.ts";
 import { resolveStateRoot } from "../isolation/stateDir.ts";
 import { type EnvelopeDraft, type EnvelopeV2, SOURCE_PATTERN, buildEnvelope } from "./envelope.ts";
 import { EnvelopeOutbox, type OutboxStats } from "./outbox.ts";
-import { SourceSequence } from "./sourceSequence.ts";
+import { SourceSequence, isTransientAllocationFailure } from "./sourceSequence.ts";
 
 export interface EnvelopeStoreOptions {
   /** Sequence domain. Default: unique per emitter instance (see {@link defaultSource}). */
@@ -215,6 +215,10 @@ export class EnvelopeStore {
   /**
    * Allocate a sequence and persist the envelope. Allocation and append happen
    * in one serialized step so outbox order == sequence order within a process.
+   *
+   * When no sequence can be allocated the result is `dead_lettered` rather than a
+   * rejection only for a live holder's refusal ({@link allocate}); every other cause
+   * still rejects, so a broken store stays loud instead of trickle-consuming events.
    */
   stage(input: EnvelopeDraft): Promise<StageResult> {
     const run = this.tail.then(() => this.stageNow(input));
@@ -255,9 +259,50 @@ export class EnvelopeStore {
       if (known) return { status: known.state === "delivered" ? "delivered" : "dead_lettered" };
     }
 
-    const sourceSequence = await this.sequence.next();
+    const sourceSequence = await this.allocate(draft, payload);
+    if (sourceSequence === null) return { status: "dead_lettered" };
     const envelope = buildEnvelope(draft, { source: this.source, sourceSequence });
     const stored = await this.outbox.append(envelope);
     return { status: stored === envelope ? "staged" : "pending", envelope: stored };
+  }
+
+  /**
+   * Allocate the sequence for one envelope, and decide what an allocation failure costs (#683).
+   *
+   * A live holder refusing to yield is transient by construction: the worst wait measured for a contended
+   * allocation on a loaded host is ~0.2 s against a 5 s budget, so the starvation is a moment and one more
+   * attempt is the whole remedy. When that attempt fails too the envelope is dead-lettered as
+   * `sequence_unavailable` and `null` is returned. Before this, the rejection reached `ControlPlaneIngest.emitDraft`,
+   * which swallowed it and returned false, so a starved host lost the event with no trace and was
+   * indistinguishable from an operator who had disabled ingest.
+   *
+   * Anything that is not a lock refusal (corrupt state file, unreadable directory) is persistent and throws
+   * unchanged: dead-lettering a broken store would consume an entire event stream one envelope at a time and
+   * make it look handled.
+   */
+  private async allocate(draft: EnvelopeDraft, payload: Record<string, unknown>): Promise<number | null> {
+    try {
+      return await this.sequence.next();
+    } catch (error) {
+      if (!isTransientAllocationFailure(error)) throw error;
+    }
+    try {
+      return await this.sequence.next();
+    } catch (error) {
+      const bytes = Buffer.byteLength(JSON.stringify(payload));
+      await this.outbox.recordUndeliverable(
+        {
+          event_type: draft.event_type,
+          entity_type: draft.entity_type,
+          entity_id: draft.entity_id,
+          occurred_at: draft.occurred_at,
+          payload_bytes: bytes,
+          payload_preview: JSON.stringify(payload).slice(0, 2048),
+          allocation_error: (error as Error).message,
+        },
+        "sequence_unavailable",
+      );
+      return null;
+    }
   }
 }

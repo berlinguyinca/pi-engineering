@@ -418,7 +418,14 @@ export class ControlPlaneIngest {
     return this.envelopeStore?.outbox.rejected ?? 0;
   }
 
-  /** Stage a draft in the outbox and try to deliver. False when disabled/failed/not (yet) delivered. */
+  /**
+   * Stage a draft in the outbox and try to deliver. False when disabled/failed/not (yet) delivered.
+   *
+   * A false here is not the end of the trail. A sequence allocation that a live holder refused twice is
+   * dead-lettered as `sequence_unavailable` inside `stage()` (#683); an allocation that failed for a persistent
+   * reason (corrupt state file) throws, is counted in `stats().sequenceFailures` and is reported by
+   * `herdr-sequence-failure` with its cause. Nothing is lost only to this `catch`.
+   */
   async emitDraft(draft: EnvelopeDraft): Promise<boolean> {
     const store = this.envelopeStore;
     if (!this.enabled || !store) return false;
@@ -426,6 +433,7 @@ export class ControlPlaneIngest {
     try {
       staged = await store.stage(draft);
     } catch {
+      // Best-effort by contract: ingest must never break the emitting path. The reason is recorded upstream.
       return false;
     }
     if (!("envelope" in staged)) return staged.status === "delivered";

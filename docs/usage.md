@@ -2029,12 +2029,25 @@ dead-lettered with an error notice and `conflictDeadLettered` in the ingest diag
 Sequence lock budget: allocating a `source_sequence` takes a cross-process lock around a read-modify-write of the
 state file. A writer that cannot take the lock waits, and gives up when its budget runs out — 5000 ms by default.
 A lock whose holder is alive is never treated as stale, so on a busy node (several agent sessions, CAV browsers,
-local builds, a shared disk) a legitimate live holder turns into a writer that refuses to write, and that envelope
-stays out of the outbox. `PI_ENGINEERING_SEQUENCE_LOCK_MS=<positive integer>` raises (or lowers) the budget for that
-host or process; a value that is not a positive integer is ignored and the default stays. Measured on this fleet's
-busiest host with 16 concurrent allocators against one source: p50 50 ms, p99 1175 ms, worst 2406 ms — about half
-the default budget, so the default is adequate but no longer comfortable; raise the budget on hosts that report
-`herdr-sequence-failure`, which now names the budget it waited, the source, and this variable.
+local builds, a shared disk) a legitimate live holder turns into a writer that refuses to write. What that costs is
+defined rather than incidental:
+
+- A refusal by a live holder is retried once. Measured on this fleet's busiest host with 16 concurrent allocators
+  against one source: p50 50 ms, p99 1175 ms, worst 2406 ms against a 5000 ms budget — the starvation is a moment,
+  so a second attempt is the whole remedy and the envelope is staged normally.
+- If the second attempt also refuses, the envelope is **dead-lettered** as `sequence_unavailable` in
+  `outbox.deadletter.jsonl`, carrying the draft's identity, its payload preview and the allocation error, and it is
+  counted in the ingest diagnostics (`deadLettered`). Before this the rejection was swallowed on the emit path, so a
+  starved host lost events with no trace and looked exactly like an operator who had disabled ingest.
+- A refusal that is not a lock timeout — a corrupt or unreadable state file — still throws and writes nothing.
+  Dead-lettering a broken store would consume an entire event stream one envelope at a time and make it look handled.
+
+`PI_ENGINEERING_SEQUENCE_LOCK_MS=<positive integer>` raises (or lowers) the budget for that host or process; a value
+that is not a positive integer is ignored and the default stays. The effective budget is announced once per process
+(`herdr-sequence-budget`, with the value of the knob in force), so an operator can confirm the setting without
+provoking a failure. A refusal is reported on onset and then every tenth consecutive refusal — a writer that keeps
+refusing never goes quiet, a starved host never floods the log — and the notice carries the holder record, the lock
+path, the elapsed wait and the budget as fields, not only as prose (`herdr-sequence-failure`).
 
 Steering requests are judged on Herdr's clock (the `Date` header of the poll response plus monotonic time since),
 not on Pi's wall clock. A request that names a digest (`expected_digest`) is applied (redirect, resume, fork, promote)
