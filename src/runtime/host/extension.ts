@@ -110,6 +110,8 @@ export interface HostExtensionConfig {
   followRemoteIntervalMs?: number;
   /** Injectable `herdr-eng memory doctor` runner for the memory preflight (tests only). */
   memoryPreflightRunner?: PreflightRunner;
+  /** Where the global `engineering.yaml` lives, for the memory preflight (default: `PI_CODING_AGENT_DIR`). */
+  agentDir?: string;
 }
 
 export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExtensionConfig {
@@ -1696,7 +1698,7 @@ export class EngineeringHostExtension {
       const now = Date.now();
       const cached = this.memoryPreflightCache;
       if (cached && now - cached.at < MEMORY_PREFLIGHT_TTL_MS) return cached.lines;
-      const { settings } = loadHindsightSettings(process.cwd());
+      const { settings } = loadHindsightSettings(process.cwd(), this.config.agentDir);
       const lines = settings.enabled
         ? formatMemoryPreflight(
             await runMemoryPreflight({
