@@ -16,7 +16,7 @@ import {
 } from "./hindsight.ts";
 import type { HindsightSettings } from "./hindsightSettings.ts";
 import { warnLegacyMemoryEnv, warnLegacyOpenViking } from "./legacyOpenViking.ts";
-import { PROVISIONING_RUNBOOK, type PreflightReport } from "./memoryPreflight.ts";
+import { PROVISIONING_RUNBOOK, type PreflightReport } from "./memoryProvisioning.ts";
 
 /** Durable memory backend: the opt-in Hindsight provider over the herdr-memory CLI. */
 type MemoryConfig = HindsightConnectionConfig & {
@@ -319,9 +319,14 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           "Memory could not be checked on this host — the client did not answer its own health checks, so nothing here says whether memory is provisioned. Run /memory status when the host is quieter.",
         kind: "inconclusive",
       };
+    const unanswered = report.checks.filter((c) => c.state === "warn");
     return {
-      sentence:
-        "Memory is provisioned and reachable — every preflight check answered. The read that just failed was slow or transient, so memory retries on its own.",
+      // Naming what did not answer keeps "reachable" from meaning more than the checks proved.
+      sentence: `Memory is provisioned and reachable — no preflight check found a gap. The read that just failed was slow or transient, so memory retries on its own.${
+        unanswered.length > 0
+          ? ` ${String(unanswered.length)} check(s) could not answer: ${unanswered.map((c) => c.name).join(", ")}.`
+          : ""
+      }`,
       kind: "slow",
     };
   };
@@ -656,6 +661,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           return;
         }
         const failing = report.checks.filter((c) => c.state === "fail").map((c) => c.name);
+        const unanswered = report.checks.filter((c) => c.state === "warn").map((c) => c.name);
         const header = result.ok
           ? `Memory connection verified: ${result.saved === null ? "saved count unknown" : `${result.saved} saved note(s)`}.\n`
           : result.failure
@@ -670,7 +676,11 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
                 ? // "No failures" is not a clean bill of health when nothing answered; saying so is the whole
                   // point of distinguishing the states.
                   "Nothing failed, but nothing answered either — the checks could not complete, so this says nothing about provisioning."
-                : "Every check answered — nothing to install or configure on this host."
+                : unanswered.length > 0
+                  ? // "No failures" and "every check answered" are different claims. A host where the doctor
+                    // wrapper is absent, or one read timed out, has no proven gap and no clean bill either.
+                    `No provisioning gap found — the read that failed was slow or transient, and memory retries on its own. ${unanswered.length} check(s) could not answer: ${unanswered.join(", ")}.`
+                  : "Every check answered — nothing to install or configure on this host."
           }`,
         );
         return;

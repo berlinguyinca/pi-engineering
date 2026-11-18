@@ -20,7 +20,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { resetHindsightBackoff } from "../../src/blackhole/hindsight.ts";
 import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory.ts";
 
-/** The same contracts as `hindsight-preflight.test.ts`, plus the two read paths the hooks exercise. */
+/** The same contracts as `memory-provisioning.test.ts`, plus the two read paths the hooks exercise. */
 const SCRIPT = `#!/bin/sh
 mode=\${FIXTURE_MODE:-healthy}
 if [ -n "\${FIXTURE_LOG:-}" ]; then echo "$1" >> "$FIXTURE_LOG"; fi
@@ -29,7 +29,6 @@ case "$1" in
     [ "$mode" = "wedged" ] && sleep 2
     echo '{"client":"0.1.8","contract":1,"harness":"pi"}'; exit 0 ;;
   validate-config) echo '{"valid":true,"contract":1,"client":"0.1.8"}'; exit 0 ;;
-  doctor) echo '{"ok":true,"checks":[{"name":"credential:project","ok":true,"detail":"readable, private permissions"},{"name":"server","ok":true,"detail":"reachable and credential accepted"}]}'; exit 0 ;;
   recall)
     [ "$mode" = "read_slow" ] && sleep 2
     [ "$mode" = "wedged" ] && sleep 2
@@ -49,11 +48,27 @@ echo '{}'
 exit 0
 `;
 
+/**
+ * `herdr-eng memory doctor --json` — the host-side half, reached through `memoryPreflight.ts` and therefore
+ * resolved through PATH rather than the `cli` setting. Real subprocess, production parser.
+ */
+const DOCTOR_SCRIPT = `#!/bin/sh
+[ "$1" = "memory" ] && [ "$2" = "doctor" ] && [ "$3" = "--json" ] || { echo "unexpected args: $*" >&2; exit 64; }
+echo '{"ok":true,"contract":1,"overall":"healthy","checks":[{"name":"credential:project","status":"ok","detail":"0600 file in 0700 parent"},{"name":"server","status":"ok","detail":"reachable and credential accepted"}]}'
+exit 0
+`;
+
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "im-preflight-"));
   const cli = join(dir, "herdr-memory");
   writeFileSync(cli, SCRIPT, { mode: 0o755 });
   chmodSync(cli, 0o755);
+  writeFileSync(join(dir, "herdr-eng"), DOCTOR_SCRIPT, { mode: 0o755 });
+  chmodSync(join(dir, "herdr-eng"), 0o755);
+  const previousPath = process.env.PATH;
+  // The doctor wrapper is found the way a real host finds it, so the interactive path exercises the same
+  // resolution `/engineering version` uses instead of a seam only tests could reach.
+  process.env.PATH = `${dir}:${previousPath ?? ""}`;
   const callLog = join(dir, "calls.log");
   const previousLog = process.env.FIXTURE_LOG;
   process.env.FIXTURE_LOG = callLog;
@@ -112,6 +127,7 @@ function fixture() {
     cleanup: () => {
       if (previousLog === undefined) delete process.env.FIXTURE_LOG;
       else process.env.FIXTURE_LOG = previousLog;
+      process.env.PATH = previousPath ?? "";
       rmSync(dir, { recursive: true, force: true });
     },
   };
@@ -158,7 +174,7 @@ test("#717: /memory status prints one preflight line per check", async () => {
     // The checks are the CLI's own answers quoted back, not a generic "memory is fine".
     assert.match(text, /client\s+ok\s+client 0\.1\.8 \(contract 1\)/);
     assert.match(text, /config\s+ok\s+configuration valid/);
-    assert.match(text, /credentials:project\s+ok\s+readable, private permissions/);
+    assert.match(text, /credential:project\s+ok\s+0600 file in 0700 parent/);
     assert.match(text, /server\s+ok\s+reachable and credential accepted/);
     assert.match(text, /bank:project\s+ok\s+pi-engineering-facts resolves \(3 record\(s\)\)/);
   } finally {
@@ -173,8 +189,10 @@ test("#717: a slow read says slow, and never claims the host is unprovisioned", 
     await withMode("read_slow", () => f.run("status"));
     const text = f.notices.map((n) => n.text).join("\n");
     assert.match(text, /timed out/, text);
-    // The verdict line is the half of the answer that tells the operator to wait rather than install.
-    assert.match(text, /Every check answered \u2014 nothing to install or configure on this host\./, text);
+    // The verdict line is the half of the answer that tells the operator to wait rather than install — and it
+    // still names the check that did not answer, instead of claiming everything did.
+    assert.match(text, /No provisioning gap found/, text);
+    assert.match(text, /1 check\(s\) could not answer: bank:project/, text);
     assert.doesNotMatch(text, /not installed|does not exist|not provisioned/, text);
     // The slow bank read is still reported, as a warning with what it cost.
     assert.match(text, /bank:project\s+warn/);

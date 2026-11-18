@@ -4,7 +4,7 @@
  * The rule itself is copied verbatim from `hindsight.ts`, where it guards every record the provider accepts
  * (lines 224 and 276 of that file as of 2026-11-18). It lives here so the preflight (#717) can apply the same
  * rule to a bank listing without importing the provider, which would make `hindsight.ts` and
- * `memoryPreflight.ts` import each other.
+ * `memoryProvisioning.ts` import each other.
  */
 
 /** True for banks in the engineering namespaces (never personal-assistant memory). */

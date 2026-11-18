@@ -17,7 +17,7 @@ import type { DurableMemoryProvider, DurableMemoryRecord, RetainResult } from ".
 import { type HindsightRunResult, type HindsightRunner, defaultRunner, makeRunner } from "./hindsightRunner.ts";
 import { type HindsightSettings, HINDSIGHT_SCOPE_RE as SCOPE_RE } from "./hindsightSettings.ts";
 import { engineeringBank } from "./memoryBanks.ts";
-import { type PreflightReport, runMemoryPreflight } from "./memoryPreflight.ts";
+import { type PreflightReport, runProvisioningChecks } from "./memoryProvisioning.ts";
 
 // The runner and the bank rule are shared with the preflight (#717), so they live in leaf modules both sides
 // can import without importing each other. These re-exports are the public paths they had before.
@@ -157,7 +157,7 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
    * provider uses, so a check that passed cannot describe a host the provider would still fail to reach.
    */
   preflight(opts?: { deadlineMs?: number }): Promise<PreflightReport> {
-    return runMemoryPreflight({
+    return runProvisioningChecks({
       cli: this.cli,
       scopes: this.scopes,
       timeoutMs: this.timeoutMs,

@@ -10,7 +10,7 @@
  * unknown `durable.kind` is refused by `config.ts` rather than falling back here.
  * Runtime dependencies: none (imports below are type-only).
  */
-import type { PreflightReport } from "./memoryPreflight.ts";
+import type { PreflightReport } from "./memoryProvisioning.ts";
 
 export interface DurableMemoryRecord {
   id: string;

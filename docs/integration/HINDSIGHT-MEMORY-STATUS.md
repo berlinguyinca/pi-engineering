@@ -273,7 +273,7 @@ A `not-installed` host stays fail-closed (reads degrade to "no memory"), but is 
 loudly and re-probed on the short failure backoff rather than being hidden behind the
 300 s unavailable pause.
 
-### Preflight: "not provisioned" vs "slow read" (2026-11-18, #717)
+### Preflight: "not provisioned" vs "slow read" (2026-11-18, #717 with #673 ask 3)
 
 The failure taxonomy above classifies *one call*. It cannot answer the question an operator
 actually asks — "is this host provisioned, or was memory just slow this turn?" — because a
@@ -282,40 +282,89 @@ steady-state recall 0.28–0.42 s, the cold spike recorded above 4.06 s (~13x ap
 8-way contention moves it by ~10% (331 ms vs 302 ms idle). So "timed out" was never
 information about provisioning, yet it printed as if it were.
 
-`src/blackhole/memoryPreflight.ts` answers it with four checks, each one an existing
-contract of the pinned CLI (all four verified against the real client on 2026-11-18 and
-pinned in `test/unit/hindsight-preflight.test.ts`):
+Two modules, one set of checks, so the two surfaces cannot disagree about the same host:
+
+- `src/blackhole/memoryPreflight.ts` consults `herdr-eng memory doctor --json` — the checks
+  herdr-engineering owns, because that package owns the pin and the credential layout — and
+  renders them for `/engineering version`. It deliberately does **not** re-implement them.
+- `src/blackhole/memoryProvisioning.ts` adds what doctor does not cover: the client the
+  runtime actually spawns (`herdr-memory`, not the wrapper) and whether each configured
+  scope resolves to an engineering bank. It asks doctor through the module above instead of
+  spawning it a second time, then turns the whole set into the verdict `/memory status` and
+  the failure notices print.
 
 | Check | Call | Proves |
 | --- | --- | --- |
-| `client` | `--version` | the binary exists, and what it says its client/contract is |
-| `config` | `validate-config` | the CLI's own config parses (nothing called this before) |
-| `credentials:<tenant>`, `server`, `outbox`, `dead_letter` | `doctor` | credential readability + private permissions, reachability, write queue |
-| `bank:<scope>` | `documents --kind fact --scope S --limit 1` | the scope resolves to an engineering bank, i.e. section 5 above ran |
+| `client` | `herdr-memory --version` | the binary the runtime talks to exists, and what it says its client/contract is |
+| `config` | `herdr-memory validate-config` | the CLI's own config parses (nothing called this before) |
+| `pin`, `package_revision`, `client_version`, `credential:<scope>:<harness>`, `server`, … | `herdr-eng memory doctor --json` | the pinned revision, credential readability + private permissions, reachability |
+| `bank:<scope>` | `herdr-memory documents --kind fact --scope S --limit 1` | the scope resolves to an engineering bank, i.e. section 5 above ran |
 
 `fail` means **retrying will not fix this** (missing binary, unusable config, refused
-credential, missing bank) and sets `provisioningGap`. `warn` means the check learned
-nothing — including nothing about the host being broken — so a slow host is never reported
-as an unprovisioned one. Checks run cheapest first and stop after a missing binary, because
-every later check would report the same absent executable and read like four problems.
-The client version is reported, never compared against a pin: the pin lives in the install
-script, and a second copy here would rot and then lie.
+credential, missing bank) and sets `provisioningGap`. `warn` means the check learned nothing
+— including nothing about the host being broken — so a slow host is never reported as an
+unprovisioned one. Doctor's own `warn` (measured 2026-11-18: `package_revision`, when the
+installed client revision drifts from the pin) stays a warning: it is "not what was
+expected", and turning it into a failure would tell an operator to provision a host that is
+already provisioned. A status outside doctor's vocabulary still maps to `fail`, so a contract
+change we cannot read never reads as healthy.
+
+Three things follow from that separation, and each is pinned by a test:
+
+- A host with `herdr-memory` but without the `herdr-eng` wrapper **warns**. Memory is
+  provisioned; only the credential checks did not run. Failing there would send the operator
+  to install a client that is already installed.
+- A client that will not answer `--version` is present but wedged: neither "install it" nor
+  "everything is fine". The report says `inconclusive` and `/memory status` says nothing
+  failed *and* nothing answered.
+- Checks run cheapest first and stop after a missing binary, because every later check would
+  report the same absent executable and read like four problems. A `deadlineMs` ceiling stops
+  the run mid-way and prints one `budget` line instead of hanging a session start.
+
+The client version is reported, never compared against a pin here: the pin lives in the
+install script, and a second copy would rot and then lie. The checks and their contracts are
+pinned in `test/unit/memory-provisioning.test.ts` (fixtures recorded from the real tools, plus
+one case that runs against the real binaries when this host has them).
 
 Where the operator sees it:
 
-- `/memory status` prints the connection probe plus one line per check and a verdict line
-  (`Every check answered — nothing to install or configure on this host.` or
-  `Failing checks: …  Fix them … — retrying will not.`). One composed answer per command,
-  including headless.
+- `/engineering version` prints a `Memory preflight:` section, one line per doctor check —
+  binary present and version matching the pin, managed config valid, credential files `0600`
+  in a `0700` parent, server reachable. Consulted **on demand** when the command runs, not at
+  session start: doctor contacts the live service (~1.35 s measured), too slow to block
+  startup. The render is reused for 60 s (`MEMORY_PREFLIGHT_TTL_MS`). Every failure path is
+  fail-closed — a missing `herdr-eng`, a timeout, a non-zero exit or unreadable output each
+  render as one `UNAVAILABLE` line and never break the command or session start. When
+  `memory.hindsight.enabled` is false the section says `disabled`.
+- `/memory status` prints the connection probe plus one line per check and a verdict line:
+  `Every check answered — nothing to install or configure on this host.`, or
+  `Failing checks: …  Fix them … — retrying will not.`, or — when some checks could not
+  answer but none failed — `No provisioning gap found … N check(s) could not answer: …`.
+  One composed answer per command, including headless.
 - A failed automatic read or `/memory <query>` adds one explanation per memory host per
   episode (5 min, `PREFLIGHT_EXPLAIN_MS`): either
-  `Memory is not provisioned on this host: <first failing check> Retrying will not fix that.`
-  or `Memory is provisioned and reachable — every preflight check answered. The read that
-  just failed was slow or transient, so memory retries on its own.`
-- Headless uses the same once-per-day telemetry channel as the failure notice, under the
-  keys `memory:preflight:not-provisioned` and `memory:preflight:slow-read`, so print-mode
-  transcripts stay clean.
+  `Memory is not provisioned on this host: <first failing check> Retrying will not fix that.`,
+  or `Memory is provisioned and reachable — no preflight check found a gap. The read that just
+  failed was slow or transient, so memory retries on its own.` (naming the checks that did not
+  answer, so "reachable" never means more than the checks proved), or the inconclusive sentence
+  telling the operator to run `/memory status` when the host is quieter.
+- Headless uses the same once-per-day telemetry channel as the failure notice, under the keys
+  `memory:preflight:not-provisioned`, `memory:preflight:slow` and
+  `memory:preflight:inconclusive`, so print-mode transcripts stay clean.
 
-A settled read clears the episode, so the next failure explains itself again. Reports are
-reused for 60 s (`PREFLIGHT_REUSE_MS`) so an explicit `/memory status` right after a
-failure does not re-spawn what just ran.
+A settled read clears the episode, so the next failure explains itself again. A background
+preflight is bounded by `PREFLIGHT_BUDGET_MS` (4 s): nobody asked for it, and a service that
+is not answering must not be hammered by four more spawns.
+
+```
+$ herdr-eng memory doctor --json --harness pi   # rendered by /engineering version
+Memory preflight: warn (18 checks, 1 warning)
+  OK      config:pi:skill  managed config valid
+  OK      pin  adapter pin d48b334b6236065aa188a696dc6e9095b04ca761
+  WARN    package_revision  herdr-memory f3a20bae5fb9 != pin d48b334b6236065aa188a696dc6e9095b04ca761
+  OK      client_version  client 0.1.8
+  UNKNOWN fleet_update  no unattended fleet update has recorded a run
+  OK      credential:project:pi-engineering:pi  0600 file in 0700 parent
+  OK      server  healthy
+  …
+```
