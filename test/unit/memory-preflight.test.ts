@@ -50,6 +50,46 @@ test("parseDoctorJson normalises any unexpected status to fail", () => {
   assert.equal(parsed.checks[0]?.status, "fail");
 });
 
+/**
+ * Recorded from `herdr-eng memory doctor --json --harness pi` on 2026-11-18: overall "warn", with
+ * `package_revision` warning because the installed client revision (f3a20bae5fb9) differs from the pin
+ * (d48b334b6236). Doctor distinguishes "not what was expected" from "broken", and the distinction is what
+ * downstream reporting turns into "wait / update later" rather than "this host was never provisioned".
+ */
+test("parseDoctorJson keeps doctor's warn distinct from fail", () => {
+  const parsed = parseDoctorJson(
+    JSON.stringify({
+      ok: true,
+      overall: "warn",
+      checks: [
+        { name: "pin", status: "ok", detail: "adapter pin d48b334b6236" },
+        { name: "package_revision", status: "warn", detail: "herdr-memory f3a20bae5fb9 != pin d48b334b6236" },
+      ],
+    }),
+  );
+  assert.ok(parsed);
+  assert.equal(parsed.checks[1]?.status, "warn");
+  assert.equal(parsed.overall, "warn");
+});
+
+test("formatMemoryPreflight renders a warning as WARN, not as a provisioning failure", () => {
+  const lines = formatMemoryPreflight({
+    available: true,
+    ok: true,
+    overall: "warn",
+    checks: [
+      { name: "pin", status: "ok", detail: "" },
+      { name: "package_revision", status: "warn", detail: "herdr-memory f3a20bae5fb9 != pin d48b334b6236" },
+    ],
+  });
+  assert.equal(lines[0], "Memory preflight: warn (2 checks, 1 warning)");
+  assert.ok(
+    lines.some((l) => /^ {2}WARN\s+package_revision/.test(l)),
+    lines.join("\n"),
+  );
+  assert.ok(!lines.some((l) => l.includes("FAIL")), "a warning must not read as a failing check");
+});
+
 test("parseDoctorJson returns null on non-JSON and on a missing checks array", () => {
   assert.equal(parseDoctorJson("not json"), null);
   assert.equal(parseDoctorJson(JSON.stringify({ ok: true })), null);

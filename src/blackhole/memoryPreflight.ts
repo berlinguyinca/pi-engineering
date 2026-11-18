@@ -22,8 +22,16 @@ import { execFile } from "node:child_process";
 /** One provisioning check as reported by `herdr-eng memory doctor`. */
 export interface MemoryPreflightCheck {
   name: string;
-  /** Normalised to one of these; any unknown doctor status maps to "fail". */
-  status: "ok" | "unknown" | "fail";
+  /**
+   * Normalised to one of these. Doctor's own vocabulary is `ok | warn | unknown | fail`, and `warn` is kept
+   * distinct: it is doctor saying "this differs from what is expected without being broken" — measured
+   * 2026-11-18 on this host, `package_revision` reports `warn` because the installed client revision drifted
+   * from the pin. Folding `warn` into `fail` would print a provisioning FAILURE for a warning, and would make
+   * the provisioned/slow distinction downstream answer "install it" for a host doctor calls healthy overall.
+   * A status outside doctor's vocabulary (a schema change we do not understand) still maps to "fail", so an
+   * unreadable contract never reads as healthy.
+   */
+  status: "ok" | "warn" | "unknown" | "fail";
   detail: string;
 }
 
@@ -74,6 +82,7 @@ interface DoctorPayload {
 
 function normaliseStatus(raw: unknown): MemoryPreflightCheck["status"] {
   if (raw === "ok") return "ok";
+  if (raw === "warn") return "warn";
   if (raw === "unknown") return "unknown";
   return "fail";
 }
@@ -145,6 +154,7 @@ export async function runMemoryPreflight(opts: {
 
 const STATUS_LABEL: Record<MemoryPreflightCheck["status"], string> = {
   ok: "OK",
+  warn: "WARN",
   unknown: "UNKNOWN",
   fail: "FAIL",
 };
@@ -159,10 +169,13 @@ export function formatMemoryPreflight(result: MemoryPreflightResult): string[] {
     return ["Memory preflight:", `  UNAVAILABLE  ${result.reason}`];
   }
   const failing = result.checks.filter((c) => c.status === "fail").length;
+  const warning = result.checks.filter((c) => c.status === "warn").length;
   const summary =
-    failing > 0
-      ? `Memory preflight: ${result.overall} (${result.checks.length} checks, ${failing} failing)`
-      : `Memory preflight: ${result.overall} (${result.checks.length} checks)`;
+    failing > 0 || warning > 0
+      ? `Memory preflight: ${result.overall} (${String(result.checks.length)} checks${
+          failing > 0 ? `, ${String(failing)} failing` : ""
+        }${warning > 0 ? `, ${String(warning)} warning` : ""})`
+      : `Memory preflight: ${result.overall} (${String(result.checks.length)} checks)`;
   const lines = [summary];
   for (const check of result.checks) {
     const label = STATUS_LABEL[check.status].padEnd(7);
