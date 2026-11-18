@@ -22,6 +22,7 @@ import { CheckpointManager } from "../../src/orchestration/checkpoints.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { makeFixtureRepo } from "../fixtures/make-fixture.ts";
+import { measureRoundTripMs, scaledBudgetMs } from "../support/hostScale.ts";
 
 type Handoff = {
   worktree: { path: string; branch: string };
@@ -424,6 +425,12 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       const git = (await GitRepo.open(fx.root))!;
       const store = MissionStore.open(JsonlEventStore.inMemory());
       const artifacts = await ArtifactStore.create(artifactRoot);
+      // The premise is "a checkpoint recorded BEFORE the budget expires", so the
+      // budget must exceed what this host needs to record one. Measured against
+      // this very store, not assumed — see test/support/hostScale.ts for the
+      // pipeline-311 evidence.
+      const hostScale = await measureRoundTripMs(artifacts);
+      const budgetMs = scaledBudgetMs(hostScale.unitMs);
       const validArtifact = await artifacts.put("checkpoint", "implementation", "verified artifact body", "proof");
       const secondValidArtifact = await artifacts.put("checkpoint", "tests", "verified artifact body", "proof");
       const base = await git.headCommit();
@@ -472,8 +479,10 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
         deliverables: ["implementation"],
         // The worker sequences its claims on the store's findings (see
         // rejectionsRecorded) and must emit the valid one before the budget
-        // expires; the budget leaves room for a slow host.
-        execution_budget_ms: 6_000,
+        // expires; the budget is derived from a measurement of this host (see
+        // hostScale above), so a loaded host stretches it instead of failing an
+        // ordering property that has nothing to do with speed.
+        execution_budget_ms: budgetMs,
         checkpoint_policy: { activity_milestone: 1, before_deadline_ms: 200 },
       });
       const handoffs: Handoff[] = [];
@@ -494,10 +503,13 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
               // host stretches the wait instead of skipping it) and fail loudly
               // rather than emit out of sequence. One shared deadline keeps the
               // whole sequence inside the execution budget.
-              const sequenceDeadline = Date.now() + 5_000;
+              const sequenceDeadline = Date.now() + Math.floor(budgetMs * 0.8);
               const until = async (what: string, condition: () => boolean): Promise<void> => {
                 while (!condition()) {
-                  if (Date.now() > sequenceDeadline) throw new Error(`${what} was not recorded in time`);
+                  if (Date.now() > sequenceDeadline)
+                    throw new Error(
+                      `${what} was not recorded in time (budget ${budgetMs}ms from a measured ${hostScale.unitMs}ms ${hostScale.measured})`,
+                    );
                   await new Promise((resolve) => setTimeout(resolve, 10));
                 }
               };
@@ -606,7 +618,12 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       const result = handle.result();
       const outcome = await Promise.race([
         result,
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("result did not hard-timeout")), 10_000)),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error(`result did not hard-timeout within ${budgetMs + 10_000}ms`)),
+            budgetMs + 10_000,
+          ),
+        ),
       ]).catch(async (error) => {
         release();
         await result.catch(() => undefined);
