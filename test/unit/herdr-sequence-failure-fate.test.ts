@@ -7,7 +7,8 @@
  * exactly like an operator who had disabled ingest. These cases pin the three answers now written down:
  *
  *   1. a live holder gets one more attempt (the measured worst contended wait on a loaded host is ~0.2 s against
- *      a 5 s budget, so the starvation is a moment, not a condition);
+ *      a 5 s budget, so the starvation is a moment, not a condition); holders in these cases are released by the
+ *      test after a recorded refusal, never by a timer, so the retry is proven rather than raced;
  *   2. if that fails too the envelope is dead-lettered as `sequence_unavailable` — durable, inspectable, counted;
  *   3. a persistent cause (corrupt state) still throws and writes nothing, because dead-lettering a broken store
  *      would eat an event stream one envelope at a time and look handled.
@@ -48,20 +49,36 @@ const lines = (p: string) =>
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 
 /**
- * Take `sequence-pi.json.lock` for `ms` from a holder the waiter can prove is alive.
+ * Take `sequence-pi.json.lock` and hold it until the case says otherwise.
+ *
+ * The holder used to release on a timer, which turned these cases into races: "released at 260 ms" only means
+ * "after the first attempt's 200 ms budget" while the host is idle, and a timer can fire hundreds of
+ * milliseconds late on a loaded CI agent -- which converts a retry that must succeed into a second refusal and a
+ * red pipeline for a correct implementation. Release is driven by the case now, after a fact the module itself
+ * records (a counted refusal), so nothing here depends on when the host happened to run two timers. Same lesson
+ * as #681/#682/#689.
  *
  * Acquisition is asynchronous, so `acquired` resolves only once the owner record is on disk -- otherwise the
  * waiter would win the race the case is meant to create.
  */
-function holdSequenceLock(dir: string, ms: number): { acquired: Promise<void>; done: Promise<void> } {
+function holdSequenceLock(dir: string): { acquired: Promise<void>; release: () => void; done: Promise<void> } {
   const lockPath = join(dir, "sequence-pi.json.lock");
-  const done = withFileLock(lockPath, () => sleep(ms), { timeoutMs: 60_000 });
-  return { acquired: waitForFile(lockPath), done };
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const done = withFileLock(lockPath, async () => void (await gate), { timeoutMs: 60_000 });
+  return { acquired: waitForFile(lockPath), release, done };
+}
+
+/** Wait for a condition the module records, with a ceiling generous enough to be a wait and not a deadline. */
+async function waitUntil(label: string, predicate: () => boolean): Promise<void> {
+  for (let i = 0; i < 4000 && !predicate(); i++) await sleep(5);
+  assert.ok(predicate(), label);
 }
 
 async function waitForFile(path: string): Promise<void> {
-  for (let i = 0; i < 400 && !existsSync(path); i++) await sleep(5);
-  assert.ok(existsSync(path), `lock file never appeared: ${path}`);
+  await waitUntil(`lock file never appeared: ${path}`, () => existsSync(path));
 }
 
 /** Run `fn` with the operator knob set to `ms`, then put the environment back. */
@@ -106,10 +123,15 @@ test("#683: a live holder that yields within the second attempt costs nothing", 
   try {
     await withBudget(200, async () => {
       const store = new EnvelopeStore({ dir, source: "pi", sequenceBlock: 1 });
-      // Released at 260ms: the first attempt's 200ms budget expires, the retry's does not.
-      const holder = holdSequenceLock(dir, 260);
+      const holder = holdSequenceLock(dir);
       await holder.acquired;
-      const staged = await store.stage(draft("e1"));
+      const staging = store.stage(draft("e1"));
+      // Release once the first attempt has demonstrably expired, so the retry starts with a full budget in
+      // front of an unlocked file. Nothing here says "wait 260ms" -- the fact being waited for is the store's
+      // own counter, which is what the retry is actually conditioned on.
+      await waitUntil("the first allocation attempt never failed", () => store.stats().sequenceFailures >= 1);
+      holder.release();
+      const staged = await staging;
       await holder.done;
       assert.deepEqual(
         { status: staged.status, failures: store.stats().sequenceFailures },
@@ -145,7 +167,8 @@ test("#683: two refusals dead-letter the envelope as sequence_unavailable instea
   try {
     await withBudget(100, async () => {
       const store = new EnvelopeStore({ dir, source: "pi", sequenceBlock: 1 });
-      const holder = holdSequenceLock(dir, 1_000);
+      // Nobody releases: both attempts must expire on their own budgets, and the envelope must survive that.
+      const holder = holdSequenceLock(dir);
       await holder.acquired;
       const staged = await store.stage(draft("e2"));
       assert.equal(staged.status, "dead_lettered");
@@ -168,6 +191,7 @@ test("#683: two refusals dead-letter the envelope as sequence_unavailable instea
       assert.equal(kept.payload_bytes, Buffer.byteLength('{"note":"kept"}'));
       assert.equal(typeof kept.allocation_error, "string");
       assert.match(String(kept.allocation_error), /timed out after 100ms waiting for lock/);
+      holder.release();
       await holder.done;
       // The warning is still emitted, and it names the budget and the knob that raises it.
       assert.match(only(notices).text, /PI_ENGINEERING_SEQUENCE_LOCK_MS/);
@@ -185,9 +209,10 @@ test("#683: the refusal reports holder, path, elapsed wait and budget as fields,
   try {
     await withBudget(80, async () => {
       const seq = new SourceSequence({ dir, source: "pi", blockSize: 1 });
-      const holder = holdSequenceLock(dir, 600);
+      const holder = holdSequenceLock(dir);
       await holder.acquired;
       await assert.rejects(() => seq.next(), /timed out after 80ms/);
+      holder.release();
       await holder.done;
     });
   } finally {
@@ -214,17 +239,21 @@ test("#683: a writer that keeps refusing keeps reporting; onset after a success 
   const { notices, off } = collect("herdr-sequence-failure");
   try {
     const seq = new SourceSequence({ dir, source: "pi", lockTimeoutMs: 40, blockSize: 1 });
-    const holder = holdSequenceLock(dir, 2_000);
+    const holder = holdSequenceLock(dir);
     await holder.acquired;
     for (let i = 0; i < 12; i++) await assert.rejects(() => seq.next(), /timed out/);
     assert.equal(seq.failures, 12);
     // Onset (1) and then every tenth refusal (11): visible without one line per attempt.
     assert.equal((nth(notices, 1, 2).detail as Record<string, unknown>).failures, 11);
+    // Released, and awaited: the lock file is gone before the next allocation starts, so this success cannot
+    // lose a race against the holder's own cleanup.
+    holder.release();
     await holder.done;
     assert.equal(await seq.next(), 1);
-    const after = holdSequenceLock(dir, 400);
+    const after = holdSequenceLock(dir);
     await after.acquired;
     await assert.rejects(() => seq.next(), /timed out/);
+    after.release();
     await after.done;
     // A fresh episode after a success is a new onset, not a continuation.
     assert.equal((nth(notices, 2, 3).detail as Record<string, unknown>).failures, 13);
