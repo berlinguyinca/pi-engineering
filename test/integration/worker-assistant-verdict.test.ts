@@ -23,18 +23,17 @@ import { test } from "node:test";
 import { resolveGatewayConfig } from "../../src/gateway/config.ts";
 import { PiWorkerExecutor } from "../../src/workers/PiWorkerExecutor.ts";
 
+/** An OpenAI-shaped error delivered in a 200 SSE body: `{error:{message,type,code}}`. */
+function errorFrame(message: string, code: string): string {
+  return `data: ${JSON.stringify({ error: { message, type: code, code } })}\n\n`;
+}
+
 /** The refusal a hosted gateway puts in a 200 SSE body for a model it does not serve. */
-const MODEL_GONE = `data: ${JSON.stringify({
-  error: {
-    message: "404 model_not_found: probe-model is not served",
-    type: "invalid_request_error",
-    code: "model_not_found",
-  },
-})}\n\n`;
+const MODEL_GONE = errorFrame("404 model_not_found: probe-model is not served", "model_not_found");
 
 async function withRefusingGateway<T>(
   run: (executor: PiWorkerExecutor, cwd: string, requests: () => number) => Promise<T>,
-  options: { endStream?: boolean; dirPrefix?: string } = {},
+  options: { endStream?: boolean; dirPrefix?: string; frame?: string } = {},
 ) {
   // A gateway that refuses and then hangs up, and one that refuses and never
   // closes the socket, are different failures for a worker: only the frame can
@@ -46,7 +45,7 @@ async function withRefusingGateway<T>(
     req.on("end", () => {
       requests++;
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.write(MODEL_GONE);
+      res.write(options.frame ?? MODEL_GONE);
       if (endStream) res.end("data: [DONE]\n\n");
     });
   });
@@ -167,4 +166,131 @@ test("a refusal on a socket that never closes still ends the run (#718)", async 
   assert.equal(error, "transient:model_unavailable", `summary: ${summary}`);
   assert.ok(elapsed < 5_000, `an unclosed socket must not hold the run (${elapsed}ms)`);
   assert.ok(requests <= 3, `a refused run must not keep issuing turns (saw ${requests} requests)`);
+});
+
+/**
+ * #725 — an in-band provider verdict that classifies into a known category must be
+ * reported as the `transient:<category>` marker the thrown path would have produced,
+ * not the provider's raw sentence. `run.error` stays a closed set of markers so the
+ * ledger, #76's model takeover and rate-limit backpressure can key on it; the wording
+ * stays in the summary where an operator reads it.
+ *
+ * The frame's `code`/`type` is dropped by the provider client for an in-band (200)
+ * verdict (formatProviderError returns only the message when there is no HTTP status),
+ * so the classifiable signal must be in the message, exactly as the model_not_found
+ * frame above carries it. The leak this fixes is the status-less TERMINAL verdict: an
+ * auth or quota refusal that advertises no wait and carries no status reaches the prose
+ * fallback today. A status- or rate-worded verdict is caught earlier by the gateway /
+ * stream branches and already carries a marker (asserted separately below), so the new
+ * rule sits after them (#725 trap 3) and only replaces the prose fallback.
+ */
+const INBAND_VERDICTS: Array<{ code: string; message: string; marker: string; wording: RegExp }> = [
+  {
+    code: "authentication_error",
+    message: "invalid api key",
+    marker: "transient:permanent",
+    wording: /invalid api key/,
+  },
+  {
+    code: "insufficient_quota",
+    message: "insufficient_quota: you exceeded your current quota; check your billing",
+    marker: "transient:permanent",
+    wording: /quota/,
+  },
+];
+
+for (const verdict of INBAND_VERDICTS) {
+  test(`an in-band ${verdict.code} verdict is reported as ${verdict.marker}, not prose (#725)`, async () => {
+    const started = Date.now();
+    const { elapsed, error, summary, details, requests } = await withRefusingGateway(
+      async (executor, cwd, count) => {
+        const run = await executor.run({
+          role: "implementer",
+          task: "t",
+          tools: [],
+          cwd,
+          modelOverride: { provider: "probe", id: "probe-model" },
+          timeoutMs: 5_000,
+        });
+        return {
+          elapsed: Date.now() - started,
+          error: run.error,
+          summary: run.result.summary,
+          details: run.result.details,
+          requests: count(),
+        };
+      },
+      { frame: errorFrame(verdict.message, verdict.code) },
+    );
+
+    assert.equal(error, verdict.marker, `summary: ${summary}`);
+    assert.notEqual(error, verdict.message, "the provider's raw prose must not be the marker");
+    assert.match(summary, verdict.wording, "the provider's own wording must still reach the operator");
+    // The marker names a category and the model it classified, like the thrown path.
+    assert.equal(
+      (details as { transient_category?: string }).transient_category,
+      verdict.marker.slice("transient:".length),
+    );
+    assert.deepEqual((details as { model?: unknown }).model, { provider: "probe", id: "probe-model" });
+    assert.ok(elapsed < 5_000, `the verdict must end the run, not the budget (${elapsed}ms)`);
+    assert.ok(requests <= 3, `a refused run must not keep issuing turns (saw ${requests} requests)`);
+  });
+}
+
+/**
+ * #725 trap 1 — `classifyError`'s fallback is `permanent`, so a blind mapping would turn
+ * arbitrary unclassifiable prose into `transient:permanent` and move the wording out of
+ * `run.error`, a worse diagnosis than today. Because the frame's `code` is dropped, the
+ * `server_error` and `rate_limit_exceeded` frames the issue measured — whose messages
+ * were "backend boom" and "slow down" — carry no classifiable signal in the message and
+ * must keep their prose, exactly like any text no classifier can place.
+ */
+for (const [code, message] of [
+  ["server_error", "backend boom"],
+  ["rate_limit_exceeded", "slow down"],
+  ["unknown", "something nobody can classify"],
+] as const) {
+  test(`an in-band ${code} verdict no classifier can place keeps its prose (#725 trap 1)`, async () => {
+    const { error, summary } = await withRefusingGateway(
+      async (executor, cwd, count) => {
+        const run = await executor.run({
+          role: "implementer",
+          task: "t",
+          tools: [],
+          cwd,
+          modelOverride: { provider: "probe", id: "probe-model" },
+          timeoutMs: 5_000,
+        });
+        return { error: run.error, summary: run.result.summary, requests: count() };
+      },
+      { frame: errorFrame(message, code) },
+    );
+
+    assert.equal(error, message, `unclassifiable prose must stay prose, not become a marker (${summary})`);
+  });
+}
+
+/**
+ * #725 trap 3 — a status- or rate-worded in-band verdict is caught by the gateway /
+ * stream branches before the new rule, so it already carries a marker and never leaked
+ * prose. This guards that the new rule did not move in front of those branches.
+ */
+test("a status-worded in-band verdict keeps its gateway marker, not the new rule (#725 trap 3)", async () => {
+  const { error, summary } = await withRefusingGateway(
+    async (executor, cwd, count) => {
+      const run = await executor.run({
+        role: "implementer",
+        task: "t",
+        tools: [],
+        cwd,
+        modelOverride: { provider: "probe", id: "probe-model" },
+        timeoutMs: 5_000,
+      });
+      return { error: run.error, summary: run.result.summary, requests: count() };
+    },
+    { frame: errorFrame("503 service unavailable", "server_error") },
+  );
+
+  assert.notEqual(error, "503 service unavailable", `a status-worded verdict must carry a marker (${summary})`);
+  assert.match(error ?? "", /^(gateway:|transient:)/, `expected a gateway/transient marker, got ${error}`);
 });

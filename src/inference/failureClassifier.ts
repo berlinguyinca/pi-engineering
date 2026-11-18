@@ -238,6 +238,12 @@ const INCOMPLETE_STREAM_PATTERNS = [
 
 const AUTH_STRING_PATTERNS =
   /\b(401|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed|invalid[_ -]?credentials|api[_ -]?key[_ -]?invalid)\b/i;
+// Account-level exhaustion wording a provider puts in a status-less body (the
+// OpenAI `insufficient_quota` type, "you exceeded your current quota", a hard
+// billing limit, out of credits). A 402/429 with the same meaning is already
+// decided by HTTP status above; this is the in-band (200-body) and prose path.
+const QUOTA_STRING_PATTERNS =
+  /\b(insufficient[_ -]?quota|quota[_ -]?(exceeded|exhausted)|exceeded[_ -]your[_ -](current[_ -])?quota|billing[_ -]?(hard[_ -]?limit|suspended)|out[_ -]of[_ -]credits?)\b/i;
 const CONTEXT_STRING_PATTERNS =
   /\b(context[_ -]?(length|window|limit|exceeded|overflow)|maximum[_ -]?context|exceeds?[_ -]the[_ -](available[_ -])?context|too[_ -]?many[_ -]?tokens|prompt[_ -]?is[_ -]?too[_ -]?long|input[_ -]?too[_ -]?long|413)\b/i;
 /** Prompt-side wording only: a 400 about max_tokens vs the window is a config error, not an overflow. */
@@ -545,6 +551,8 @@ export function classifyInferenceFailure(input: ClassifyInferenceFailureInput): 
     }
     if (AUTH_STRING_PATTERNS.test(text))
       return finish(input, "authentication", { source: "string_fallback", reason: "auth phrasing" });
+    if (QUOTA_STRING_PATTERNS.test(text))
+      return finish(input, "billing", { source: "string_fallback", reason: "quota / billing phrasing" });
     if (STALE_ROUTE_STRING_PATTERNS.test(text))
       return finish(input, "routing_stale", { source: "string_fallback", reason: "stale-route phrasing" });
     if (MODEL_NOT_FOUND_STRING_PATTERNS.test(text))
