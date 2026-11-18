@@ -133,6 +133,20 @@ function parkingWaitWording(action: string, category: FailureCategory | undefine
   }
 }
 
+/** What a parking action's probe is, named so wording never implies a budget. */
+function parkingProbeName(action: string): string {
+  return action === "PAUSE_FOR_PERSISTENCE" ? "storage check" : "gateway probe";
+}
+
+/** An open (planned/started) parking decision: the wait or the gate is still ahead. */
+function isOpenParkingProbe(input: AttentionInput): boolean {
+  return (
+    input.recoveryAction !== undefined &&
+    PARKING_WAIT_ACTIONS.has(input.recoveryAction as RecoveryAction) &&
+    (input.recoveryStatus === undefined || ["planned", "started"].includes(input.recoveryStatus))
+  );
+}
+
 function ageMs(at: string | null | undefined, now: number): number | undefined {
   const parsed = Date.parse(at ?? "");
   return Number.isNaN(parsed) ? undefined : Math.max(0, now - parsed);
@@ -201,6 +215,15 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
         kind: "capacity_wait",
         ...(input.waitingSince ? { at: input.waitingSince } : {}),
         detail: `${wait.lead} ${input.recovery.attempt}; ${wait.resumes}${timing.length > 0 ? `; ${timing.join(", ")}` : ""}`,
+      });
+    } else if (parkingAction !== undefined) {
+      // The probe ran and the decision settled without restoring progress. The
+      // number on a parking decision counts waits, not attempts, so "195 of 8"
+      // invents a budget that was never spent (#501 F-A, the counter #489
+      // removed for parked waits). What is true is that the probe ended badly.
+      evidence.push({
+        kind: "recovery_exhausted",
+        detail: `the last ${parkingProbeName(parkingAction)} did not restore progress`,
       });
     } else {
       evidence.push({
@@ -300,6 +323,15 @@ export function deriveAttention(input: AttentionInput): MissionAttention | null 
   if (!terminal && heartbeatAge === undefined && progressAge === undefined) {
     evidence.push({ kind: "no_proof_of_life", detail: "no heartbeat and no recorded progress" });
     return { severity: "medium", reason: evidence[0]!.detail, evidence };
+  }
+
+  // A repair gate with an open probe decision (#501 F-B): nothing runs until the
+  // probe fires, but whether it is sleeping or executing is not a fact the
+  // summary carries, so this says only what is true either way instead of
+  // leaving the mission to render as plain active work with no note at all.
+  if (state === "REPAIRING" && isOpenParkingProbe(input)) {
+    evidence.push({ kind: "waiting", detail: "repair gate re-running; the mission continues when it passes" });
+    return { severity: "low", reason: evidence[0]!.detail, evidence };
   }
 
   return null;
