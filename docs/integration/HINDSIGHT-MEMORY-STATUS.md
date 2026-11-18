@@ -272,3 +272,30 @@ pi -p -e 'what did we record about <topic>?'  # memory block present, not "0 rec
 A `not-installed` host stays fail-closed (reads degrade to "no memory"), but is reported
 loudly and re-probed on the short failure backoff rather than being hidden behind the
 300 s unavailable pause.
+
+### Preflight surface: `/engineering version`
+
+So a never-provisioned or misconfigured host is visible *before* recall-time failure,
+`/engineering version` prints a `Memory preflight:` section, one line per provisioning
+check — binary present and version matching the pin, managed config valid, credential
+files `0600` in a `0700` parent, and the server reachable. The checks are not
+re-implemented in pi: the section surfaces `herdr-eng memory doctor --json` (scoped to
+the configured harness), which already owns the pin and the credential layout.
+
+The preflight is consulted **on demand** when the command runs, not at session start:
+doctor contacts the live service (~1.35 s measured), too slow to block startup. The
+result is cached for 60 s so repeated `/engineering version` calls do not re-probe.
+Every failure path is fail-closed — a missing `herdr-eng`, a timeout, a non-zero exit or
+unreadable output each render as a single `UNAVAILABLE` line and never break the command
+or session start. When `memory.hindsight.enabled` is false the section simply says
+`disabled`.
+
+```
+Memory preflight: unknown (18 checks)
+  OK      pin  adapter pin d48b334b6236065aa188a696dc6e9095b04ca761
+  OK      package_revision  herdr-memory d48b334b6236 matches pin
+  OK      client_version  client 0.1.8
+  OK      credential:project:pi-engineering:pi  0600 file in 0700 parent
+  OK      server  healthy
+  …
+```

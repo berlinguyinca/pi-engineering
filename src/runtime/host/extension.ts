@@ -14,7 +14,9 @@ import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import { type PreflightRunner, formatMemoryPreflight, runMemoryPreflight } from "../../blackhole/memoryPreflight.ts";
 import { safeGitOrThrow, safeGitSyncOut } from "../../git/safeGit.ts";
+import { loadHindsightSettings } from "../../lifecycle/policy.ts";
 import { SourceCache, type TrustedSource, type UpdateChannel } from "../../update/gitSource.ts";
 import { type RuntimeUpdateBridge, runtimeUpdateBridge, setRuntimeUpdateBridge } from "../../update/hostBridge.ts";
 import { InstallLayout } from "../../update/installLayout.ts";
@@ -57,6 +59,9 @@ import {
 import { type RuntimeEventFields, RuntimeTelemetry } from "./telemetry.ts";
 
 export const DEFAULT_RUNTIME_ENTRY = "src/runtime/host/runtimeEntry.ts";
+
+/** How long a memory preflight result is reused before `/engineering version` re-probes doctor. */
+const MEMORY_PREFLIGHT_TTL_MS = 60_000;
 
 export interface HostExtensionConfig {
   /** Pi Engineering's own state: generations, versions, journal (default ~/.pi/pi-engineering). */
@@ -103,6 +108,10 @@ export interface HostExtensionConfig {
   followRemote?: boolean;
   /** How often the remote is fetched (default 5 min). */
   followRemoteIntervalMs?: number;
+  /** Injectable `herdr-eng memory doctor` runner for the memory preflight (tests only). */
+  memoryPreflightRunner?: PreflightRunner;
+  /** Where the global `engineering.yaml` lives, for the memory preflight (default: `PI_CODING_AGENT_DIR`). */
+  agentDir?: string;
 }
 
 export function resolveHostConfig(env: NodeJS.ProcessEnv = process.env): HostExtensionConfig {
@@ -524,6 +533,9 @@ export class EngineeringHostExtension {
    * Shown in the status line, `/engineering version` and the panel.
    */
   startupFallback: string | undefined;
+
+  /** Last memory preflight render, reused within MEMORY_PREFLIGHT_TTL_MS (#673 ask 3). */
+  private memoryPreflightCache: { at: number; lines: string[] } | undefined;
 
   private unpublish: () => void = () => {};
   private checkTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1199,7 +1211,7 @@ export class EngineeringHostExtension {
         );
       }
       case "version":
-        return notify(ctx, this.versionText());
+        return notify(ctx, this.versionText(await this.memoryPreflightLines()));
       case "status":
         return notify(ctx, this.panelLines(Date.now()).join("\n"));
       default: {
@@ -1672,7 +1684,37 @@ export class EngineeringHostExtension {
     return undefined;
   }
 
-  versionText(): string {
+  /**
+   * Memory provisioning preflight lines for `/engineering version` (#673 ask 3).
+   *
+   * Consulted on demand, not at session start: `herdr-eng memory doctor`
+   * contacts the live service (~1.35 s measured), too slow to block startup.
+   * The result is cached briefly so repeated `/engineering version` calls do
+   * not re-probe. Fail-closed throughout: any error becomes a single
+   * UNAVAILABLE line and never breaks the command.
+   */
+  private async memoryPreflightLines(): Promise<string[]> {
+    try {
+      const now = Date.now();
+      const cached = this.memoryPreflightCache;
+      if (cached && now - cached.at < MEMORY_PREFLIGHT_TTL_MS) return cached.lines;
+      const { settings } = loadHindsightSettings(process.cwd(), this.config.agentDir);
+      const lines = settings.enabled
+        ? formatMemoryPreflight(
+            await runMemoryPreflight({
+              harness: settings.harness,
+              ...(this.config.memoryPreflightRunner ? { runner: this.config.memoryPreflightRunner } : {}),
+            }),
+          )
+        : ["Memory preflight:", "  disabled (memory.hindsight.enabled is false)"];
+      this.memoryPreflightCache = { at: now, lines };
+      return lines;
+    } catch (error) {
+      return ["Memory preflight:", `  UNAVAILABLE  preflight check failed: ${(error as Error)?.message ?? "unknown"}`];
+    }
+  }
+
+  versionText(preflightLines?: string[]): string {
     const host = this.host;
     const active = host?.activeGeneration();
     const prefs = readPreferences(this.layout.preferencesFile);
@@ -1715,6 +1757,7 @@ export class EngineeringHostExtension {
       "Last reload:",
       ago(host?.lastReloadAt),
     ];
+    if (preflightLines && preflightLines.length > 0) lines.push("", ...preflightLines);
     if (this.startupFallback) lines.push("", `Startup: ${this.startupFallback}`);
     // Tool names a generation could not register (#672). Before this, a session
     // that had lost `ledger_evidence` had no surface that said so.
