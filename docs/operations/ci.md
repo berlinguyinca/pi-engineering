@@ -229,3 +229,10 @@ sockets off a short root — `os.tmpdir()` is the wrong root on macOS, where it 
 - If a test's fixture depends on a host shape (HOME under the temp dir, a path long enough
   to overflow a limit), assert the fixture got there. A test that silently cannot reach its
   condition is worse than one that fails.
+- Do not make a claim about concurrency by counting entries inside a callback and comparing
+  wall clocks. On a loaded agent the second dispatch arrives after the first body returns, and
+  a correct implementation goes red. Ask the module that made the scheduling decision —
+  `Scheduler.maxInFlight` records its own admission high-water precisely because admission is
+  a synchronous decision, so the number does not depend on the host. This is the shared cause
+  of #681, #682 and #689; each one was a green-on-idle-laptop assertion that measured the
+  machine rather than the code.

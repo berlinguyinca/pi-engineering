@@ -108,8 +108,6 @@ async function setup(
 }
 
 test("plan -> parallel implement -> review -> integrate, with planner and implementer on different models", async () => {
-  let inFlight = 0;
-  let maxInFlight = 0;
   const { fixture, server, executor } = await setup(async (req) => {
     const role = roleOf(req);
     if (role === "planner") {
@@ -127,14 +125,6 @@ test("plan -> parallel implement -> review -> integrate, with planner and implem
     }
     if (role === "implementer") {
       const id = taskOf(req);
-      inFlight++;
-      maxInFlight = Math.max(maxInFlight, inFlight);
-      // Long enough (even under full-suite event-loop contention) that a second
-      // independent contract's dispatch reliably reaches this handler while the
-      // first is still in flight, so the concurrency assertion observes the
-      // intended overlap instead of a load-induced serialization artifact.
-      await new Promise((r) => setTimeout(r, 600));
-      inFlight--;
       return {
         content: JSON.stringify({
           status: "completed",
@@ -156,7 +146,13 @@ test("plan -> parallel implement -> review -> integrate, with planner and implem
     ["delta", "passed"],
     ["gamma", "passed"],
   ]);
-  assert.ok(maxInFlight >= 2, `independent contracts must run concurrently (max in flight ${maxInFlight})`);
+  // #689: the concurrency claim is made on the limiter's own admission record. The old version counted entries
+  // inside the scripted gateway handler and compared wall clocks, so on a host doing other work the second
+  // dispatch arrived after the first handler returned and a correct implementation failed with "max in flight 1".
+  assert.ok(
+    executor.peakWorkerConcurrency >= 2,
+    `independent contracts must be admitted together (limiter high-water: ${executor.peakWorkerConcurrency})`,
+  );
 
   // Planner, implementer and reviewer resolved by capability; planner != implementer.
   const byRole = new Map<string, Set<string>>();
