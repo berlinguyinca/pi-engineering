@@ -16,7 +16,7 @@ import {
 } from "./hindsight.ts";
 import type { HindsightSettings } from "./hindsightSettings.ts";
 import { warnLegacyMemoryEnv, warnLegacyOpenViking } from "./legacyOpenViking.ts";
-import { PROVISIONING_RUNBOOK, type PreflightReport, runMemoryPreflight } from "./memoryPreflight.ts";
+import { PROVISIONING_RUNBOOK, type PreflightReport } from "./memoryPreflight.ts";
 
 /** Durable memory backend: the opt-in Hindsight provider over the herdr-memory CLI. */
 type MemoryConfig = HindsightConnectionConfig & {
@@ -73,6 +73,13 @@ const FAILURE_MESSAGES: Record<string, string> = {
   rejected: "Hindsight refused the write",
   queued: "Hindsight queued the write without confirming it",
 };
+
+/**
+ * Failure codes a preflight is not asked about (#717): `not-installed` already names the gap, `rejected` and
+ * `queued` are about a write the server answered, and `timeout` is a client that just failed to answer — which
+ * the readiness contract says is not re-probed.
+ */
+const NOT_PROBED = new Set(["not-installed", "rejected", "queued", "timeout"]);
 
 const RECALL_TTL_MS = 60_000;
 const MAX_CACHED_QUERIES = 32;
@@ -257,7 +264,13 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   const failure = (ctx: ExtensionContext, code: string, description: string, explicit = false, quiet = false) => {
     recalled = "";
     setStatus(ctx, description);
-    const text = `${description}. Run /memory to check; set memory.hindsight.enabled: false in engineering.yaml to turn memory off.`;
+    const text = [
+      `${description}.`,
+      verdictLine(),
+      "Run /memory status for provisioning one line per check; set memory.hindsight.enabled: false in engineering.yaml to turn memory off.",
+    ]
+      .filter(Boolean)
+      .join(" ");
     if (quiet) {
       lastFailure = code;
       return;
@@ -279,44 +292,96 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   /**
    * #717 — "the read failed" is two different operator actions wearing one sentence: a host that was never
    * provisioned (install it, configure it, create the bank) and a host whose read was merely slow (wait; it
-   * retries itself). The preflight decides which from the CLI's own contracts so the notice can say so.
-   *
-   * Rate-limited per memory host, because a down service would otherwise spawn a fresh probe every turn.
+   * retries itself). The backend's own preflight answers which from the CLI's contracts, and the answer is
+   * remembered so the notice can say it without spawning the thing that just failed a second time.
    */
   const PREFLIGHT_EXPLAIN_MS = 5 * 60_000;
-  /** A report stays reusable briefly, so an explicit `/memory status` does not re-spawn what just ran. */
-  const PREFLIGHT_REUSE_MS = 60_000;
+  /** A background preflight is bounded: nobody asked for it, and a service that is not answering must not be hammered. */
+  const PREFLIGHT_BUDGET_MS = 4_000;
+  let verdict: { identity: string; atMs: number; sentence: string; kind: "gap" | "slow" | "inconclusive" } | null =
+    null;
   let explainedAt: { identity: string; atMs: number } | null = null;
-  let lastReport: { identity: string; atMs: number; report: PreflightReport } | null = null;
-  /** The explanation an explicit command awaits, so `/memory status` prints a settled picture. */
-  let explanationPending: Promise<void> = Promise.resolve();
 
-  const preflightFor = async (config: MemoryConfig, maxAgeMs: number): Promise<PreflightReport> => {
-    if (lastReport && lastReport.identity === config.identity && now() - lastReport.atMs < maxAgeMs)
-      return lastReport.report;
-    const report = await runMemoryPreflight(config);
-    lastReport = { identity: config.identity, atMs: now(), report };
+  /**
+   * The three states a preflight can leave an operator in, in the order they are acted on. One builder, so the
+   * background explanation and the notice that quotes it later cannot drift into disagreeing about the same host.
+   */
+  const explainSentence = (report: PreflightReport): { sentence: string; kind: "gap" | "slow" | "inconclusive" } => {
+    const gap = report.checks.find((c) => c.state === "fail");
+    if (gap)
+      return {
+        sentence: `Memory is not provisioned on this host: ${gap.detail} Retrying will not fix that.`,
+        kind: "gap",
+      };
+    if (report.inconclusive)
+      return {
+        sentence:
+          "Memory could not be checked on this host — the client did not answer its own health checks, so nothing here says whether memory is provisioned. Run /memory status when the host is quieter.",
+        kind: "inconclusive",
+      };
+    return {
+      sentence:
+        "Memory is provisioned and reachable — every preflight check answered. The read that just failed was slow or transient, so memory retries on its own.",
+      kind: "slow",
+    };
+  };
+
+  /** Run the backend's provisioning checks and remember what they said. Null when the backend cannot answer. */
+  const runPreflight = async (
+    client: DurableMemoryProvider,
+    identity: string,
+    deadlineMs?: number,
+  ): Promise<PreflightReport | null> => {
+    const probe = client.preflight?.bind(client);
+    if (!probe) return null;
+    const report = await probe(deadlineMs === undefined ? undefined : { deadlineMs });
+    const explained = explainSentence(report);
+    verdict = { identity, atMs: now(), sentence: explained.sentence, kind: explained.kind };
     return report;
   };
 
-  const explainFailure = (ctx: ExtensionContext, config: MemoryConfig): void => {
-    if (explainedAt && explainedAt.identity === config.identity && now() - explainedAt.atMs < PREFLIGHT_EXPLAIN_MS)
+  /** What the last preflight proved — the sentence a failure notice carries. Empty when nothing has answered. */
+  const verdictLine = (): string => {
+    const config = resolve();
+    if (!config || !verdict || verdict.identity !== fingerprint(config)) return "";
+    return verdict.sentence;
+  };
+
+  /**
+   * Ask the backend why the read failed, at most once per memory host per episode. A `timeout` never comes
+   * here: a client that just failed to answer is not re-probed (pinned by the readiness tests), and a timeout
+   * is evidence about the call rather than the host anyway.
+   *
+   * The answer is written only while the caller's context is still current — background work that lands after
+   * `session_shutdown` records state and touches nothing.
+   */
+  const explainFailure = (
+    ctx: ExtensionContext,
+    conn: { client: DurableMemoryProvider; identity: string },
+    id: number,
+  ): void => {
+    if (explainedAt && explainedAt.identity === conn.identity && now() - explainedAt.atMs < PREFLIGHT_EXPLAIN_MS)
       return;
-    explainedAt = { identity: config.identity, atMs: now() };
-    explanationPending = preflightFor(config, 0)
+    explainedAt = { identity: conn.identity, atMs: now() };
+    // Deliberately not awaited: a failed readiness probe must not hold the session open, and the notice that
+    // already went out is the answer the operator has until this one lands.
+    void runPreflight(conn.client, conn.identity, PREFLIGHT_BUDGET_MS)
       .then((report) => {
-        const gap = report.checks.find((c) => c.state === "fail");
-        const text = gap
-          ? `Memory is not provisioned on this host: ${gap.detail} Retrying will not fix that.`
-          : "Memory is provisioned and reachable — every preflight check answered. The read that just failed was slow or transient, so memory retries on its own.";
+        if (!report || !current(id, conn.identity)) return;
+        const explained = explainSentence(report);
+        const text = explained.sentence;
         if (!ctx.hasUI) {
           // Headless has no status line and no transcript slot for this: the same once-per-day telemetry
           // channel the failure notice uses, under its own key so the two never overwrite each other.
-          if (firstNoticeToday(noticeDir(), `${config.identity}:preflight:${gap ? "gap" : "slow"}`))
-            emitTelemetry({ level: "warning", key: `memory:preflight:${gap ? "not-provisioned" : "slow-read"}`, text });
+          if (firstNoticeToday(noticeDir(), `${conn.identity}:preflight:${explained.kind}`))
+            emitTelemetry({
+              level: "warning",
+              key: `memory:preflight:${explained.kind === "gap" ? "not-provisioned" : explained.kind}`,
+              text,
+            });
           return;
         }
-        reply(ctx, text, gap !== undefined);
+        reply(ctx, text, explained.kind === "gap");
       })
       .catch(() => {
         // Best-effort: the failure notice itself already reached the operator.
@@ -326,10 +391,19 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   /** A settled read proves the host is fine again, so the next episode has to be explained afresh. */
   const clearFailureExplanation = () => {
     explainedAt = null;
-    lastReport = null;
+    verdict = null;
   };
 
-  const handleError = (ctx: ExtensionContext, error: unknown, explicit = false, quiet = false): string => {
+  /** `conn` + `id` let a failure ask the backend why, fenced to the context that saw it. */
+  interface FailureContext {
+    explicit?: boolean;
+    quiet?: boolean;
+    conn?: { client: DurableMemoryProvider; identity: string };
+    id?: number;
+  }
+
+  const handleError = (ctx: ExtensionContext, error: unknown, at: FailureContext = {}): string => {
+    const { explicit = false, quiet = false, conn, id } = at;
     const code = error instanceof HindsightError ? error.code : "unavailable";
     clearRecall(explicit);
     // A refused write or a server outage will not fix itself between turns, so those stay
@@ -348,11 +422,9 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           : (cfg?.failureBackoffMs ?? 60_000));
     const description = FAILURE_MESSAGES[code] ?? "memory unavailable";
     failure(ctx, code, description, explicit, quiet);
-    // A missing CLI already names its own gap, and a refused write is not a provisioning question; everything
-    // else is ambiguous, so the preflight settles it out loud. A composing caller says all of that itself.
-    const provisioned = resolve();
-    if (!quiet && provisioned && code !== "not-installed" && code !== "rejected" && code !== "queued")
-      explainFailure(ctx, provisioned);
+    // A missing CLI already names its own gap, a refused write is not a provisioning question, and a client
+    // that just timed out is not re-probed. Everything else is ambiguous, so the backend says which it was.
+    if (!quiet && conn !== undefined && id !== undefined && !NOT_PROBED.has(code)) explainFailure(ctx, conn, id);
     return description;
   };
   const reset = () => {
@@ -407,7 +479,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         identity,
       };
     } catch (error) {
-      handleError(ctx, error, explicit);
+      handleError(ctx, error, { explicit });
       return;
     }
   };
@@ -419,19 +491,33 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
   /**
    * Readiness probe. `announce` is false when the caller composes its own answer (so `/memory status` sends
    * one message instead of two). The result says what the probe proved: `ok` = the CLI answered and `saved` is
-   * the note count if it is known; otherwise `failure` carries the sentence the operator was told (empty when
-   * nothing was attempted — memory off, backing off, or superseded by newer work).
+   * the note count if it is known; `failure` carries the sentence the operator was told (empty when nothing was
+   * attempted — memory off, backing off, or superseded by newer work); `client` is the backend that was asked,
+   * so a composing caller can put the provisioning question to the same backend the probe used.
    */
   const check = async (
     ctx: ExtensionContext,
     explicit: boolean,
     announce = true,
-  ): Promise<{ ok: boolean; saved: number | null; failure: string }> => {
+  ): Promise<{
+    ok: boolean;
+    saved: number | null;
+    failure: string;
+    client: DurableMemoryProvider | null;
+    identity: string;
+  }> => {
     const conn = connection(ctx, explicit, !explicit);
     // A composing caller (`/memory status`) prints one answer, so the probe stays silent and hands back what
     // it learned instead of notifying.
     const quiet = explicit && !announce;
-    if (!conn) return { ok: false, saved: null, failure: quiet ? "memory is off or backing off" : "" };
+    if (!conn)
+      return {
+        ok: false,
+        saved: null,
+        failure: quiet ? "memory is off or backing off" : "",
+        client: null,
+        identity: "",
+      };
     const id = generation;
     const epoch = automaticLookupEpoch;
     setStatus(ctx, "checking");
@@ -447,7 +533,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
               : READINESS_LOOKUP_MS,
           ));
       if (!current(id, conn.identity) || (!explicit && epoch !== automaticLookupEpoch))
-        return { ok: false, saved: null, failure: "" };
+        return { ok: false, saved: null, failure: "", client: null, identity: conn.identity };
       lastFailure = "";
       retryAfter = 0;
       clearFailureExplanation();
@@ -456,14 +542,20 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       setStatus(ctx, saved === null ? "ready · count unknown" : `ready · ${saved} saved`);
       const verified = `Memory connection verified: ${saved === null ? "saved count unknown" : `${saved} saved note(s)`}. /remember <text> saves an explicit note; /memory <query> searches.`;
       if (explicit && announce) reply(ctx, verified);
-      return { ok: true, saved, failure: "" };
+      return { ok: true, saved, failure: "", client: conn.client, identity: conn.identity };
     } catch (error) {
       // A failed readiness check still counts as having been attempted: the next
       // automatic lookup must not pay the unhurried budget again.
       readinessDone = true;
       if (current(id, conn.identity) && (explicit || epoch === automaticLookupEpoch))
-        return { ok: false, saved: null, failure: handleError(ctx, error, explicit, quiet) };
-      return { ok: false, saved: null, failure: "" };
+        return {
+          ok: false,
+          saved: null,
+          failure: handleError(ctx, error, { explicit, quiet, conn, id }),
+          client: conn.client,
+          identity: conn.identity,
+        };
+      return { ok: false, saved: null, failure: "", client: null, identity: conn.identity };
     }
   };
 
@@ -549,11 +641,20 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       }
       if (!query || query === "status") {
         const result = await check(ctx, true, false);
-        // Print the preflight the failure path just ran, if it ran moments ago; otherwise run it now.
-        await explanationPending;
-        const config = resolve();
-        if (!config) return;
-        const report = await preflightFor(config, PREFLIGHT_REUSE_MS);
+        // Ask the same backend the probe just used; it answers one line per check, through its own runner.
+        if (!result.client) return;
+        const report = await runPreflight(result.client, result.identity).catch(() => null);
+        if (!report) {
+          // Nothing to provision here (a backend without checks): the operator still gets one answer, saying
+          // what the probe proved — silence would read as the command doing nothing.
+          reply(
+            ctx,
+            result.ok
+              ? `Memory connection verified: ${result.saved === null ? "saved count unknown" : `${result.saved} saved note(s)`}. This memory backend has no provisioning checks.`
+              : `${result.failure || "Memory could not be reached"} — this memory backend has no provisioning checks, so /memory status cannot say more.`,
+          );
+          return;
+        }
         const failing = report.checks.filter((c) => c.state === "fail").map((c) => c.name);
         const header = result.ok
           ? `Memory connection verified: ${result.saved === null ? "saved count unknown" : `${result.saved} saved note(s)`}.\n`
@@ -565,7 +666,11 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
           `${header}Memory preflight, one line per check:\n${report.summary}\n${
             report.provisioningGap
               ? `Failing checks: ${failing.join(", ")}. Fix them (see ${PROVISIONING_RUNBOOK}) — retrying will not.`
-              : "Every check answered — nothing to install or configure on this host."
+              : report.inconclusive
+                ? // "No failures" is not a clean bill of health when nothing answered; saying so is the whole
+                  // point of distinguishing the states.
+                  "Nothing failed, but nothing answered either — the checks could not complete, so this says nothing about provisioning."
+                : "Every check answered — nothing to install or configure on this host."
           }`,
         );
         return;
@@ -596,7 +701,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
         setStatus(ctx, `ready · ${block.count} matches`);
         reply(ctx, block.text || "Memory connection verified; no matching notes.");
       } catch (error) {
-        if (current(id, conn.identity)) handleError(ctx, error, true);
+        if (current(id, conn.identity)) handleError(ctx, error, { explicit: true, conn, id });
       }
     },
   });
@@ -679,7 +784,7 @@ export function registerInteractiveMemory(pi: ExtensionAPI, options: Interactive
       adopt(await automatic(request, budgetMs));
     } catch (error) {
       if (current(id, conn.identity) && epoch === automaticLookupEpoch) {
-        unavailable = unavailableNotice(handleError(ctx, error));
+        unavailable = unavailableNotice(handleError(ctx, error, { conn, id }));
       }
     }
   });

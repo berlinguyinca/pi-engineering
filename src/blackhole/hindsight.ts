@@ -10,19 +10,19 @@
  * Configured only through YAML (`memory.hindsight` in engineering.yaml; see
  * hindsightSettings.ts and docs/usage.md). No environment variables.
  */
-import { execFile } from "node:child_process";
 import { loadHindsightSettings } from "../lifecycle/policy.ts";
 import { redactSecrets } from "../platform/redact.ts";
 import type { PartialBlackholeConfig } from "./config.ts";
 import type { DurableMemoryProvider, DurableMemoryRecord, RetainResult } from "./durableProvider.ts";
+import { type HindsightRunResult, type HindsightRunner, defaultRunner, makeRunner } from "./hindsightRunner.ts";
 import { type HindsightSettings, HINDSIGHT_SCOPE_RE as SCOPE_RE } from "./hindsightSettings.ts";
+import { engineeringBank } from "./memoryBanks.ts";
+import { type PreflightReport, runMemoryPreflight } from "./memoryPreflight.ts";
 
-export interface HindsightRunResult {
-  stdout: string;
-  exitCode: number;
-}
-/** Injectable subprocess runner; must reject or resolve non-zero on failure. */
-export type HindsightRunner = (cli: string, args: string[], timeoutMs: number) => Promise<HindsightRunResult>;
+// The runner and the bank rule are shared with the preflight (#717), so they live in leaf modules both sides
+// can import without importing each other. These re-exports are the public paths they had before.
+export { type HindsightRunResult, type HindsightRunner, defaultRunner, makeRunner } from "./hindsightRunner.ts";
+export { engineeringBank } from "./memoryBanks.ts";
 
 /** What the provider needs to reach the CLI; derived from `memory.hindsight`. */
 export interface HindsightConnectionConfig {
@@ -72,51 +72,11 @@ const MAX_DOCUMENT_PAGES = 3;
 const MAX_LIST_RECORDS = 50;
 const ADDRESS_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
-/** True for banks in the engineering namespaces (never personal-assistant memory). */
-export function engineeringBank(bank: unknown, scope?: string): bank is string {
-  if (typeof bank !== "string" || /^(personal|rakazo|assistant)/i.test(bank)) return false;
-  if (scope === "global") return bank === "herdr-global";
-  if (scope === "infra") return bank === "herdr-infra";
-  if (scope?.startsWith("mission:"))
-    return bank.endsWith(`-mission-${scope.slice(8)}`) && /^[a-z0-9][a-z0-9_-]*-mission-[a-z0-9_-]+$/.test(bank);
-  if (scope === "project") return /^[a-z0-9][a-z0-9_-]*-facts$/.test(bank);
-  return (
-    bank === "herdr-global" ||
-    bank === "herdr-infra" ||
-    /^[a-z0-9][a-z0-9_-]*-(?:facts|mission-[a-z0-9_-]+)$/.test(bank)
-  );
-}
-
 interface DocumentPage {
   bank: string;
   items: Record<string, unknown>[];
   exactTotal: number | null;
 }
-
-/**
- * herdr-memory picks the credential and provenance harness from HERDR_HARNESS
- * (default "codex"). That is the CLI's own interface, so it is set on the child
- * process from the `memory.hindsight.harness` setting; Pi never reads it.
- */
-export const makeRunner =
-  (harness: string): HindsightRunner =>
-  (cli, args, timeoutMs) =>
-    new Promise((resolve, reject) => {
-      const env = { ...process.env, HERDR_HARNESS: harness };
-      execFile(
-        cli,
-        args,
-        { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true, env },
-        (error, stdout) => {
-          if (!error) return resolve({ stdout, exitCode: 0 });
-          const code = (error as { code?: unknown }).code;
-          if (typeof code === "number") return resolve({ stdout: String(stdout ?? ""), exitCode: code });
-          reject(error); // ENOENT, timeout kill, etc.
-        },
-      );
-    });
-
-export const defaultRunner: HindsightRunner = makeRunner("pi");
 
 export class HindsightError extends Error {
   readonly code: "unavailable" | "not-installed" | "timeout" | "exit" | "response" | "rejected" | "queued";
@@ -190,6 +150,20 @@ export class HindsightDurableMemory implements DurableMemoryProvider {
   /** Cache-key component: scopes + write epoch + highest revision observed. */
   cacheScope(): string {
     return `${this.scopes.join(",")}#e${this.epoch}#r${this.revisionWatermark}`;
+  }
+
+  /**
+   * Provisioning checks (#717), through this backend's own runner: the same spawn, harness and timeout the
+   * provider uses, so a check that passed cannot describe a host the provider would still fail to reach.
+   */
+  preflight(opts?: { deadlineMs?: number }): Promise<PreflightReport> {
+    return runMemoryPreflight({
+      cli: this.cli,
+      scopes: this.scopes,
+      timeoutMs: this.timeoutMs,
+      run: this.run,
+      ...(opts?.deadlineMs === undefined ? {} : { deadlineMs: opts.deadlineMs }),
+    });
   }
 
   private async call(args: string[], timeoutMs = this.timeoutMs): Promise<Record<string, unknown>> {

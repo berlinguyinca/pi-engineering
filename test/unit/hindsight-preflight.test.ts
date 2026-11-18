@@ -52,6 +52,7 @@ mode=\${FIXTURE_MODE:-healthy}
 case "$1" in
   --version)
     [ "$mode" = "no_version" ] && { echo "not json at all"; exit 0; }
+    [ "$mode" = "wedged" ] && sleep 2
     echo '${VERSION_JSON}'
     exit 0
     ;;
@@ -62,6 +63,7 @@ case "$1" in
     ;;
   doctor)
     if [ "$mode" = "cred_fail" ]; then echo '${DOCTOR_CRED_FAIL_JSON}'; exit 1; fi
+    if [ "$mode" = "doctor_rows" ]; then echo '{"ok":true,"checks":[{"ok":true,"detail":"no name"},{"name":"server"},{"name":"server","ok":false,"detail":"unreachable"}]}'; exit 1; fi
     echo '${DOCTOR_OK_JSON}'
     exit 0
     ;;
@@ -221,7 +223,63 @@ test("#717: a slow read is a warning, never a provisioning gap", async () => {
     );
     assert.equal(check(report, "bank:project")?.state, "warn");
     assert.equal(report.provisioningGap, false, "a slow host is provisioned; the notice must not say otherwise");
+    assert.equal(report.inconclusive, false, "the other checks did answer, so the report is not empty of evidence");
     assert.match(String(check(report, "bank:project")?.detail), /slow|timed out/);
+  } finally {
+    cleanup();
+  }
+});
+
+/**
+ * The third state, which is the one an absent-minded report gets wrong in the other direction: a client that
+ * will not answer `--version` is present but wedged, so "install the client" is wrong, and "everything is
+ * fine" is equally wrong. Nothing was proved, and the report has to say that.
+ */
+test("#717: a client that will not answer --version is inconclusive, not unprovisioned", async () => {
+  const { cli, cleanup } = fixtureCli();
+  try {
+    const report = await withMode("wedged", () =>
+      runMemoryPreflight({ cli, scopes: ["project"], timeoutMs: 250, harness: "pi" }),
+    );
+    assert.equal(report.provisioningGap, false, "the binary is there; sending the operator to install it is a lie");
+    assert.equal(report.inconclusive, true, "and the absence of a failure is not a clean bill of health either");
+    // Nothing after it is pretended: every later check would report the same unresponsive client.
+    assert.deepEqual(names(report), ["client"]);
+    assert.equal(check(report, "client")?.state, "warn");
+    assert.match(String(check(report, "client")?.detail), /not answering/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("#717: a ceiling reached mid-run is reported as a check that learned nothing", async () => {
+  const { cli, cleanup } = fixtureCli();
+  try {
+    // The client check always runs first; the ceiling is already spent by the time the next one is due.
+    const report = await withMode("healthy", () =>
+      runMemoryPreflight({ cli, scopes: ["project", "global"], timeoutMs: 5_000, deadlineMs: 0, harness: "pi" }),
+    );
+    assert.deepEqual(names(report), ["client", "budget"]);
+    assert.equal(check(report, "budget")?.state, "warn");
+    assert.match(String(check(report, "budget")?.detail), /did not run learned nothing/);
+    // The client did answer, so this is not "nothing proved" — but it is not a provisioning verdict either.
+    assert.equal(report.provisioningGap, false);
+    assert.equal(report.inconclusive, false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("#717: a doctor row that cannot be read is skipped, not invented", async () => {
+  const { cli, cleanup } = fixtureCli();
+  try {
+    const report = await withMode("doctor_rows", () =>
+      runMemoryPreflight({ cli, scopes: ["project"], timeoutMs: 5_000, harness: "pi" }),
+    );
+    // Two of the three rows are missing `name` or `ok`; only the complete one becomes a check, once.
+    assert.deepEqual(names(report), ["client", "config", "server", "bank:project"]);
+    assert.equal(check(report, "server")?.state, "fail");
+    assert.equal(report.provisioningGap, true);
   } finally {
     cleanup();
   }

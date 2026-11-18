@@ -8,7 +8,9 @@
  * default and by tests, so promotion is exercisable end to end with no external
  * service. A retired backend is not silently mapped onto this interface: an
  * unknown `durable.kind` is refused by `config.ts` rather than falling back here.
+ * Runtime dependencies: none (imports below are type-only).
  */
+import type { PreflightReport } from "./memoryPreflight.ts";
 
 export interface DurableMemoryRecord {
   id: string;
@@ -50,6 +52,12 @@ export interface DurableMemoryProvider {
   cacheScope?(): string;
   /** Strict health probe: exact saved count, or null when bounded enumeration is truncated; throws on failure. */
   probe?(): Promise<number | null>;
+  /**
+   * Optional provisioning checks (#717): what an operator would have to install or configure on this host, one
+   * line per check. Absent on backends with nothing to provision; a backend that answers must answer through
+   * the same path its reads use, or the report describes a host the provider could still fail to reach.
+   */
+  preflight?(opts?: { deadlineMs?: number }): Promise<PreflightReport>;
 }
 
 /** Dependency-free in-memory durable store (default provider). */

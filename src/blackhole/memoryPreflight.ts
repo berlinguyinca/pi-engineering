@@ -21,7 +21,8 @@
  * Nothing here asserts a version pin: the pin lives in herdr-engineering's install script, so the check reports
  * the observed client and contract instead of hardcoding a number that would rot and then lie.
  */
-import { type HindsightRunner, engineeringBank, makeRunner } from "./hindsight.ts";
+import { type HindsightRunner, makeRunner } from "./hindsightRunner.ts";
+import { engineeringBank } from "./memoryBanks.ts";
 
 export type PreflightState = "ok" | "warn" | "fail";
 
@@ -41,6 +42,12 @@ export interface PreflightReport {
    * half of the notice that says "install / configure", as opposed to "the service was slow this turn".
    */
   provisioningGap: boolean;
+  /**
+   * True when nothing was proved either way — every check that ran said "I could not tell" (a client that
+   * will not answer `--version`, a ceiling reached before anything completed). Neither of the two answers the
+   * operator acts on is available, so the notice must say that instead of picking one.
+   */
+  inconclusive: boolean;
   /** One line per check, in check order — what `/memory status` prints and what a headless notice names. */
   summary: string;
 }
@@ -59,10 +66,18 @@ export const PREFLIGHT_CHECK_ORDER = [
 export interface PreflightConfig {
   cli: string;
   scopes: string[];
+  /** Per-call ceiling, the same `memory.hindsight.timeout_ms` the provider uses. */
   timeoutMs: number;
-  harness: string;
+  /** Harness handed to the CLI when this module has to build its own runner. */
+  harness?: string;
   /** Injectable subprocess runner (same contract as the provider's). Defaults to a real spawn. */
   run?: HindsightRunner;
+  /**
+   * Overall ceiling for the whole preflight. A check that would start after it is not started: an operator
+   * waiting on `/memory status` or a session start gets a partial report plus one `budget` line rather than
+   * four more spawns of something that is not answering.
+   */
+  deadlineMs?: number;
 }
 
 interface RawCall {
@@ -112,10 +127,22 @@ function doctorCheckName(name: string): string {
  * after that would each report the same missing binary, which reads like four problems instead of one.
  */
 export async function runMemoryPreflight(config: PreflightConfig): Promise<PreflightReport> {
-  const run = config.run ?? makeRunner(config.harness);
+  const run = config.run ?? makeRunner(config.harness ?? "pi");
   const checks: PreflightCheck[] = [];
   const add = (name: string, state: PreflightState, detail: string, beganAt: number) =>
     checks.push({ name, state, detail, ms: Math.max(0, Date.now() - beganAt) });
+  const startedAt = Date.now();
+  /** Past the overall ceiling, and the ceiling is a fact about the host's speed, never about provisioning. */
+  const outOfBudget = () => config.deadlineMs !== undefined && Date.now() - startedAt >= config.deadlineMs;
+  const budgetLine = () => {
+    add(
+      "budget",
+      "warn",
+      `preflight stopped at its ${String(config.deadlineMs)} ms ceiling — the checks that did not run learned nothing`,
+      Date.now(),
+    );
+    return finish(checks);
+  };
 
   // 1. Is the client even here, and what does it say it is?
   let beganAt = Date.now();
@@ -130,7 +157,15 @@ export async function runMemoryPreflight(config: PreflightConfig): Promise<Prefl
     return finish(checks);
   }
   if (version.timedOut) {
-    add("client", "fail", `herdr-memory did not answer --version within ${config.timeoutMs} ms`, beganAt);
+    // Present but wedged: `--version` is local and answers in milliseconds, so a client that will not answer it
+    // is unhealthy without anything being unprovisioned. Calling that a provisioning gap would send the
+    // operator to install a binary that is already there.
+    add(
+      "client",
+      "warn",
+      `herdr-memory did not answer --version within ${config.timeoutMs} ms — the client is present but not answering, and nothing else could be checked`,
+      beganAt,
+    );
     return finish(checks);
   }
   const client = text(version.json?.client);
@@ -143,6 +178,7 @@ export async function runMemoryPreflight(config: PreflightConfig): Promise<Prefl
   add("client", "ok", `client ${client} (contract ${contract})`, beganAt);
 
   // 2. Does the CLI's own config parse? This is the check nothing used to call.
+  if (outOfBudget()) return budgetLine();
   beganAt = Date.now();
   const validated = await call(run, config.cli, ["validate-config"], config.timeoutMs);
   const valid = boolean(validated.json?.valid);
@@ -162,6 +198,7 @@ export async function runMemoryPreflight(config: PreflightConfig): Promise<Prefl
 
   // 3. Credentials and reachability, from the CLI's own doctor. A failing doctor still exits with JSON, so
   //    the exit code is not the signal — each reported check is.
+  if (outOfBudget()) return budgetLine();
   beganAt = Date.now();
   const doctor = await call(run, config.cli, ["doctor"], config.timeoutMs);
   if (doctor.timedOut) {
@@ -182,6 +219,7 @@ export async function runMemoryPreflight(config: PreflightConfig): Promise<Prefl
   // 4. Does each configured scope resolve to a bank? A never-written bank 404s (herdr-memory#17), which means
   //    the first memory call a project ever makes cannot succeed.
   for (const scope of config.scopes) {
+    if (outOfBudget()) return budgetLine();
     beganAt = Date.now();
     const listing = await call(
       run,
@@ -236,6 +274,9 @@ function finish(checks: PreflightCheck[]): PreflightReport {
   return {
     checks,
     provisioningGap: checks.some((c) => c.state === "fail"),
+    // Nothing ok and nothing failing means every check that ran declined to answer — which is not evidence
+    // of a healthy host, whatever the absence of a failure might suggest.
+    inconclusive: checks.length > 0 && !checks.some((c) => c.state === "ok") && !checks.some((c) => c.state === "fail"),
     summary: checks.map((c) => `${c.name}  ${ICON[c.state]}  ${c.detail}  (${c.ms} ms)`).join("\n"),
   };
 }

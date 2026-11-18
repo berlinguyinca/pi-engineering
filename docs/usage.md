@@ -1633,7 +1633,12 @@ waits `automatic_recall_ms` and a headless run 5 s. Run `/memory status` to see 
 wrong: it answers the CLI's own `--version`, `validate-config`, `doctor` and one bank
 listing per scope, and prints one line per check with a verdict — "is this host
 provisioned" (`fail` = retrying will not fix it) is a different answer from "this read was
-slow" (`warn`), and the failure notices now say which one happened.
+slow" (`warn`), and the failure notices now say which one happened. There is a third
+answer: when the client answers nothing at all — it will not even reply to `--version` —
+the report says so instead of calling the host healthy or unprovisioned, because neither
+claim was earned. An automatic failure notice never re-probes a client that just timed
+out — four more calls to the thing that is not answering is how #673 got worse under
+load — while `/memory status` does run the checks after a timeout, because there you asked.
 A turn never proceeds in silence: if the budget expires the model is told memory
 "could not be read this turn … unavailable, not empty", and an answer that arrives
 late is used by the next model call of the same turn. The measurements behind these numbers are in

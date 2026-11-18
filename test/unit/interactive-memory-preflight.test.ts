@@ -11,7 +11,7 @@
  * the pinned client, so the notice is produced from real subprocess output through the production parser.
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -23,12 +23,16 @@ import { registerInteractiveMemory } from "../../src/blackhole/interactiveMemory
 /** The same contracts as `hindsight-preflight.test.ts`, plus the two read paths the hooks exercise. */
 const SCRIPT = `#!/bin/sh
 mode=\${FIXTURE_MODE:-healthy}
+if [ -n "\${FIXTURE_LOG:-}" ]; then echo "$1" >> "$FIXTURE_LOG"; fi
 case "$1" in
-  --version) echo '{"client":"0.1.8","contract":1,"harness":"pi"}'; exit 0 ;;
+  --version)
+    [ "$mode" = "wedged" ] && sleep 2
+    echo '{"client":"0.1.8","contract":1,"harness":"pi"}'; exit 0 ;;
   validate-config) echo '{"valid":true,"contract":1,"client":"0.1.8"}'; exit 0 ;;
   doctor) echo '{"ok":true,"checks":[{"name":"credential:project","ok":true,"detail":"readable, private permissions"},{"name":"server","ok":true,"detail":"reachable and credential accepted"}]}'; exit 0 ;;
   recall)
     [ "$mode" = "read_slow" ] && sleep 2
+    [ "$mode" = "wedged" ] && sleep 2
     echo '{"results":[]}'
     exit 0
     ;;
@@ -50,6 +54,9 @@ function fixture() {
   const cli = join(dir, "herdr-memory");
   writeFileSync(cli, SCRIPT, { mode: 0o755 });
   chmodSync(cli, 0o755);
+  const callLog = join(dir, "calls.log");
+  const previousLog = process.env.FIXTURE_LOG;
+  process.env.FIXTURE_LOG = callLog;
   const agentDir = join(dir, "agent");
   mkdirSync(agentDir);
   writeFileSync(
@@ -92,7 +99,21 @@ function fixture() {
       assert.ok(handler, `${event} is registered`);
       await handler(payload, ctx);
     },
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    /** Every action the CLI was asked for, in order — so "it did not re-probe" is a fact, not a reading. */
+    calls: (): string[] => {
+      try {
+        return readFileSync(callLog, "utf8")
+          .split("\n")
+          .filter((line) => line.length > 0);
+      } catch {
+        return [];
+      }
+    },
+    cleanup: () => {
+      if (previousLog === undefined) delete process.env.FIXTURE_LOG;
+      else process.env.FIXTURE_LOG = previousLog;
+      rmSync(dir, { recursive: true, force: true });
+    },
   };
 }
 
@@ -176,23 +197,73 @@ test("#717: a never-written bank says the bank is missing and names the remedy",
   }
 });
 
+/**
+ * The state a report with no failures is most likely to get wrong: a client that answers nothing would print
+ * "nothing to install or configure", which is the opposite of useful.
+ */
+test("#717: /memory status on a wedged client claims neither healthy nor unprovisioned", async () => {
+  resetHindsightBackoff();
+  const f = fixture();
+  try {
+    await withMode("wedged", () => f.run("status"));
+    const text = f.notices.map((n) => n.text).join("\n");
+    assert.match(text, /nothing answered either/, text);
+    assert.doesNotMatch(text, /nothing to install or configure/, text);
+    assert.doesNotMatch(text, /not provisioned/, text);
+    // The client check itself is still printed, with what it cost, so the operator sees which call hung.
+    assert.match(text, /client\s+warn/);
+  } finally {
+    f.cleanup();
+  }
+});
+
 /** The automatic path (session readiness), where there is no command answer to compose into. */
 test("#717: a failing host explains itself once per episode, not once per turn", async () => {
   resetHindsightBackoff();
   const f = fixture();
   try {
     await withMode("missing_bank", async () => {
-      const gap = /not provisioned on this host/;
+      // The standalone explanation is its own notice; a failure notice merely quotes the verdict it produced.
+      const explanation = (text: string) => text.startsWith("Memory is not provisioned on this host:");
       await f.emit("session_start");
-      await waitNotices(f.notices, gap, 1);
+      await waitNotices(f.notices, /not provisioned on this host/, 1);
       assert.match(f.notices.map((n) => n.text).join("\n"), /PUT \/v1\/default\/banks\//);
+      assert.equal(f.notices.filter((n) => explanation(n.text)).length, 1, "the episode is explained once");
       await f.emit("session_start");
       // Give the second probe time to fail (and to explain, if it were going to) before counting.
       await waitNotices(f.notices, /exited unsuccessfully/, 2);
       assert.equal(
-        f.notices.filter((n) => gap.test(n.text)).length,
+        f.notices.filter((n) => explanation(n.text)).length,
         1,
         "a second failure inside the interval does not repeat the explanation",
+      );
+      // It does not go quiet either: the second notice carries the verdict the first one produced.
+      const second = f.notices.filter((n) => /exited unsuccessfully/.test(n.text)).at(-1)!;
+      assert.match(second.text, /not provisioned on this host/, "the notice says install, not retry");
+    });
+  } finally {
+    f.cleanup();
+  }
+});
+
+/**
+ * The invariant #673 pinned, restated for the preflight: a client that just failed to answer is not asked
+ * again. Four spawns after a timeout would be four more calls to the thing that is not answering.
+ */
+test("#717: a client that timed out is not re-probed", async () => {
+  resetHindsightBackoff();
+  const f = fixture();
+  try {
+    // Readiness first, in a healthy mode, so the turn below pays the in-turn budget (300 ms) not the startup one.
+    await withMode("healthy", () => f.emit("session_start"));
+    await withMode("read_slow", async () => {
+      await f.emit("before_agent_start", { prompt: "metric units", systemPrompt: "" });
+      await waitNotices(f.notices, /timed out/, 1);
+      const calls = f.calls();
+      assert.ok(calls.includes("recall"), "the read itself was attempted");
+      assert.ok(
+        !calls.includes("--version") && !calls.includes("doctor") && !calls.includes("validate-config"),
+        `a timed-out client was re-probed: ${calls.join(" ")}`,
       );
     });
   } finally {
