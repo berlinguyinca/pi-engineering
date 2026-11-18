@@ -30,6 +30,8 @@ async function world(
     beforeStart?: (w: { install: string }) => void;
     /** Stamp the preferences with an older check, past the 4h interval (#480). */
     staleLastCheckAt?: string;
+    /** Injected memory preflight runner (#673 ask 3). */
+    memoryPreflightRunner?: import("../../src/blackhole/memoryPreflight.ts").PreflightRunner;
   } = {},
 ) {
   const key = `__rt_ux_${process.pid}_${++seq}`;
@@ -61,6 +63,7 @@ async function world(
     entry: "runtime.ts",
     baseline: true,
     autoUpdateCheck: opts.autoUpdateCheck ?? false,
+    ...(opts.memoryPreflightRunner ? { memoryPreflightRunner: opts.memoryPreflightRunner } : {}),
   });
   const pi: PiTestSession = await startPiSession({ factories: [(api: never) => ext.install(api)], cwd });
   cleanups.push(() => pi.close());
@@ -135,6 +138,40 @@ test("/engineering version and the runtime status show version, generation, sche
   assert.ok(waiting.includes("Active:") && waiting.includes("1 active inference request"));
   op.end();
   await w.host.pendingTask()?.promise;
+});
+
+test("/engineering version surfaces the memory provisioning preflight, one line per check (#673 ask 3)", async () => {
+  const doctor = JSON.stringify({
+    ok: false,
+    overall: "unknown",
+    checks: [
+      { name: "pin", status: "ok", detail: "adapter pin d48b334b6236" },
+      { name: "package_revision", status: "ok", detail: "herdr-memory d48b334b6236 matches pin" },
+      { name: "server", status: "fail", detail: "unreachable" },
+    ],
+  });
+  const w = await world({ memoryPreflightRunner: async () => ({ stdout: doctor, exitCode: 1 }) });
+  const notes: string[] = [];
+  const ctx = { cwd: join(w.state, ".."), ui: { notify: (text: string) => notes.push(text) } };
+  await w.ext.command("version", ctx);
+  const text = notes.join("\n");
+  assert.match(text, /Memory preflight: unknown \(3 checks, 1 failing\)/);
+  assert.match(text, /OK\s+pin\s+adapter pin/);
+  assert.match(text, /FAIL\s+server\s+unreachable/);
+});
+
+test("/engineering version reports the preflight as UNAVAILABLE when herdr-eng is missing, without failing the command (#673)", async () => {
+  const w = await world({
+    memoryPreflightRunner: async () => {
+      throw Object.assign(new Error("spawn herdr-eng ENOENT"), { code: "ENOENT" });
+    },
+  });
+  const notes: string[] = [];
+  const ctx = { cwd: join(w.state, ".."), ui: { notify: (text: string) => notes.push(text) } };
+  await w.ext.command("version", ctx);
+  const text = notes.join("\n");
+  assert.match(text, /Version:\s+0\.2\.0/);
+  assert.match(text, /Memory preflight:\n {2}UNAVAILABLE {2}herdr-eng is not installed on this host/);
 });
 
 test("/engineering rollback: previous version, named version, migration undone from its checkpoint (§27, §36)", async () => {
