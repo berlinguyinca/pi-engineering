@@ -69,6 +69,27 @@ describe("incomplete stream (transient:incomplete_stream)", () => {
       assert.equal(f.source, "network_code", code);
     }
   });
+
+  it("classifies account-level quota / billing exhaustion from status-less prose as billing (#725)", () => {
+    for (const text of [
+      "insufficient_quota: you have exceeded your current quota",
+      "You exceeded your current quota, please check your plan and billing details",
+      "quota exhausted for this account",
+      "billing hard limit reached",
+      "you are out of credits",
+    ]) {
+      const f = classifyInferenceFailure({ error: new Error(text) });
+      assert.equal(f.class, "billing", text);
+      assert.equal(f.retryable, false, text);
+      assert.equal(f.source, "string_fallback", text);
+    }
+  });
+
+  it("a 429 quota refusal stays rate_limited: HTTP status outranks quota prose (#725)", () => {
+    const md = metadataFromResponse({ status: 429, body: { message: "quota exhausted for account" } });
+    const f = classifyInferenceFailure({ error: new Error("quota exhausted for account"), metadata: md });
+    assert.equal(f.class, "rate_limited");
+  });
 });
 
 // ─── InferWeave JSON error bodies (structural, independent of headers) ──────

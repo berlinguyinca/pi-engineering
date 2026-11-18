@@ -1496,6 +1496,23 @@ export class PiWorkerExecutor implements WorkerExecutor {
         // the resilience path instead of #76's model takeover.
         const verdict = lastAssistantError === undefined ? undefined : terminalAssistantVerdict(lastAssistantError);
         const timed = timedOut && verdict === undefined;
+        // An in-band provider verdict (200 SSE body) that classifies into a
+        // known category: report the marker the thrown path would, so the
+        // ledger and downstream consumers can key on it instead of raw prose
+        // (#725). Computed only when none of the shapes with their own marker
+        // (budget, timeout, truncated reply/stream, gateway wait, modelGone,
+        // stalled stream) apply, so it only ever replaces the prose fallback.
+        const inbandMarker =
+          !budgetExhausted &&
+          !timed &&
+          !truncated &&
+          !gateway &&
+          !modelGone &&
+          lastAssistantError !== undefined &&
+          !isTruncatedStream(lastAssistantError) &&
+          !isStalledStream(lastAssistantError)
+            ? inbandVerdictMarker(lastAssistantError)
+            : undefined;
         const reason = budgetExhausted
           ? "Worker exceeded the hard context-token budget."
           : timed
@@ -1519,7 +1536,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
                     ? "truncated_after_progress"
                     : isStalledStream(lastAssistantError)
                       ? "transient:network"
-                      : (lastAssistantError ?? "no-result");
+                      : inbandMarker
+                        ? `transient:${inbandMarker}`
+                        : (lastAssistantError ?? "no-result");
         if (gateway) {
           recordRetryTrace(retryTrace, {
             layer: "worker-gateway-hold",
@@ -1541,7 +1560,9 @@ export class PiWorkerExecutor implements WorkerExecutor {
               ? { gateway_wait: gateway, gateway_retries: gatewayRetries, retry_trace: retryTrace }
               : modelGone
                 ? { model: { provider: model.provider, id: model.id } }
-                : {},
+                : inbandMarker
+                  ? { transient_category: inbandMarker, model: { provider: model.provider, id: model.id } }
+                  : {},
             error,
           },
           usage: account.usage(streamResumes.count),
@@ -2779,4 +2800,40 @@ export function terminalAssistantVerdict(text: string): TransientErrorCategory |
   // Context overflow has its own ladder (compact once, then fail structured).
   if (class_.category === "context_overflow") return undefined;
   return class_.retryable ? undefined : class_.category;
+}
+
+/**
+ * The `transient:<category>` marker for an in-band provider verdict (#725).
+ *
+ * A gateway that answers 200 and puts the verdict in the SSE body produces a
+ * terminal assistant-message error, not a throw, so the transient layer never
+ * classified it: `run.error` leaked the provider's raw sentence and nothing
+ * downstream (model takeover #76, rate-limit backpressure, the scheduler's
+ * resilience-vs-permanent split) could key on it.
+ *
+ * Returns the category the thrown path would have reported — but ONLY when a
+ * classifier actually identified the error. `classifyError`'s fallback is
+ * `permanent` (src/guard/transient.ts), so mapping every in-band error by its
+ * category name would turn arbitrary unclassifiable prose into
+ * `transient:permanent` and move the wording out of `run.error`, a worse
+ * diagnosis than today (#725 trap 1). A `permanent` category is therefore
+ * mapped only when the unified classifier placed the text in a non-`unknown`
+ * class (an identified auth / billing / quota / invalid-request verdict); bare
+ * fallback prose returns undefined and stays prose.
+ *
+ * `context_overflow` is excluded: it has its own ladder (compact once, then
+ * fail structured) and must not become a transient marker (#725 trap 2). The
+ * gateway-wait / truncated / stalled / model_not_found shapes already own their
+ * markers in the classification ladder and reach this function only after each
+ * has been given its own marker (#725 trap 3), so order in the ladder, not this
+ * function, keeps them distinct.
+ */
+export function inbandVerdictMarker(text: string): TransientErrorCategory | undefined {
+  const cls = classifyError(text);
+  if (cls.category === "context_overflow") return undefined;
+  // Every non-permanent category is only ever returned on a positive match, so
+  // it is identified by construction; `permanent` is the one that doubles as
+  // the fallback, so it must be corroborated by the unified classifier.
+  if (cls.category !== "permanent") return cls.category;
+  return classifyInferenceFailure({ error: text }).class !== "unknown" ? cls.category : undefined;
 }
