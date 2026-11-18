@@ -59,6 +59,11 @@ import { GenerationGuard } from "../src/guard/GenerationGuard.ts";
 import { RECOVERY_PROMPT, TOOL_TRANSITION_RULE, buildDegenerationEvent } from "../src/guard/RecoveryController.ts";
 import { resolveGuardConfig } from "../src/guard/config.ts";
 import { registerPrimaryWorktreeGuard } from "../src/guard/primaryWorktreeGuard.ts";
+import {
+  loadReviewOnlyModelConfig,
+  registerReviewOnlyModelGuard,
+  resolveReviewOnlyModelGuardConfig,
+} from "../src/guard/reviewOnlyModelGuard.ts";
 import { guardFeedFor } from "../src/guard/streamText.ts";
 import { registerToolCallGuard } from "../src/guard/toolCallGuard.ts";
 import { admissionIdentityHeaders } from "../src/inference/admissionTransport.ts";
@@ -1253,6 +1258,23 @@ export default function (pi: ExtensionAPI) {
     // ops sessions set PI_ENG_PRIMARY=1; PI_ENG_WORKTREE_GUARD=0 disables
     // (src/guard/primaryWorktreeGuard.ts; docs/usage.md, "Primary worktree guard").
     registerPrimaryWorktreeGuard(pi as never, () => process.cwd());
+    // A model the operator marked review-only must not implement (#727): while
+    // this session's LIVE model is in `models.review_only`, its own mutating
+    // calls are blocked; reads, tests/CI and the review tools are untouched.
+    // Registered synchronously with a getter and armed by the async
+    // engineering.yaml read, so a slow file read never leaves a session
+    // unguarded and a session with no file stays inert (no list = no control).
+    // PI_ENG_REVIEW_ONLY_MODELS overrides the file; PI_ENG_REVIEW_ONLY_GUARD=0
+    // disables (src/guard/reviewOnlyModelGuard.ts; docs/usage.md, "Review-only
+    // model guard").
+    let reviewOnlyConfig = resolveReviewOnlyModelGuardConfig();
+    registerReviewOnlyModelGuard(pi, () => reviewOnlyConfig);
+    void loadReviewOnlyModelConfig(getAgentDir())
+      .then(({ config, notes }) => {
+        reviewOnlyConfig = config;
+        if (notes.length > 0) console.error(`[pi-engineering] review-only guard: ${notes.join("; ")}`);
+      })
+      .catch((error) => console.error("[pi-engineering] review-only guard configuration failed", error));
     pi.on("tool_result", async (event) => {
       if (event.toolName !== "mission") return;
       const text = event.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
