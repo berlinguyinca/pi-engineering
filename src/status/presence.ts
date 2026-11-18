@@ -18,6 +18,8 @@ export interface PresenceRow {
   attention: boolean;
   /** Why this mission deserves attention, when there is a fact that says so. */
   attentionReason?: string;
+  /** The same reason cut to the strip's row width, caveat preserved. */
+  attentionRowReason?: string;
 }
 
 export interface PresenceView {
@@ -115,11 +117,32 @@ function comparePresence(a: RuntimeMissionActivityEvent, b: RuntimeMissionActivi
 
 /** Terminal-safe text: a title or sentence from anywhere in the stack may carry secrets. */
 function safe(text: string, max: number): string {
-  const flat = redactSecrets(text)
+  const flat = flatten(text);
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+function flatten(text: string): string {
+  return redactSecrets(text)
     .replace(/[\p{Cc}\p{Cf}]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/**
+ * The clause that says how a wait ends ("unless paused or stopped") is the part
+ * an operator can act on, so it survives a width cut even when the counters in
+ * front of it do not (#501). Cutting from the front dropped it at both 80 and 44,
+ * which left a parked mission reading as an unbounded wait with no action in it.
+ */
+const ATTENTION_CAVEAT = /[,;]\s*(unless paused or stopped)\b[^;,]*/;
+function attentionAtWidth(reason: string, max: number): string {
+  const flat = flatten(reason);
+  if (flat.length <= max) return flat;
+  const caveat = ATTENTION_CAVEAT.exec(flat)?.[1];
+  if (caveat === undefined) return `${flat.slice(0, max - 1)}…`;
+  const rest = flatten(flat.replace(ATTENTION_CAVEAT, "")).replace(/[;,]\s*$/, "");
+  const room = Math.max(8, max - caveat.length - 3);
+  return `${rest.length > room ? `${rest.slice(0, room - 1)}…` : rest} · ${caveat}`;
 }
 
 function percentOf(event: RuntimeMissionActivityEvent, basis?: PresenceBasis): string {
@@ -151,7 +174,12 @@ function rowOf(event: RuntimeMissionActivityEvent, now: number, basis?: Presence
     age: ageOf(event, now),
     attention: presenceRank(event) <= 1,
     // Carried so a surface can say *why* without re-deriving it from narration.
-    ...(attention && attention.severity !== "info" ? { attentionReason: safe(attention.reason, 80) } : {}),
+    ...(attention && attention.severity !== "info"
+      ? {
+          attentionReason: attentionAtWidth(attention.reason, 80),
+          attentionRowReason: attentionAtWidth(attention.reason, 44),
+        }
+      : {}),
   };
 }
 
@@ -226,7 +254,7 @@ export function renderWidgetLines(view: PresenceView): string[] {
     // The columns say *what state it is in*; when a fact says why to look, it
     // goes at the end of the row, where it reads as a sentence and the columns
     // above still line up. The full reason stays on the working line.
-    return row.attentionReason ? `${line} · ${safe(row.attentionReason, 44)}` : line;
+    return row.attentionRowReason ? `${line} · ${row.attentionRowReason}` : line;
   });
   return [view.header, ...columns, ...(view.overflow ? [view.overflow] : [])];
 }

@@ -318,6 +318,79 @@ test("the working line leads with the evidence when there is any", () => {
   assert.equal(view.rows[0]?.attentionReason, "repeated tool call ×9 — bash npm test");
 });
 
+/**
+ * #501 F-A. A parking decision whose probe *ended* without restoring progress is
+ * not a wait, and its attempt counter is a wait counter: 195 probes against a
+ * strategy budget of 8 reads as "8 attempts, 195 spent", which #489 removed for
+ * parked waits and this path still printed.
+ */
+test("a parking probe that ended without restoring progress drops the counters (#501 F-A)", () => {
+  for (const recoveryStatus of ["failed", "exhausted"] as const) {
+    const attention = capped({ failureCategory: "PROVIDER_TRANSIENT", recoveryStatus });
+    assert.equal(attention?.evidence[0]?.kind, "recovery_exhausted", recoveryStatus);
+    assert.equal(attention?.reason, "the last gateway probe did not restore progress", recoveryStatus);
+    assert.doesNotMatch(attention!.reason, /\d+ of \d+|probe \d+|attempt \d+/, recoveryStatus);
+  }
+
+  const storage = deriveAttention(
+    base({
+      state: "BLOCKED",
+      health: "blocked",
+      recovery: { attempt: 195, maxAttempts: 8 },
+      recoveryAction: "PAUSE_FOR_PERSISTENCE",
+      failureCategory: "PERSISTENCE_FAILURE",
+      recoveryStatus: "failed",
+    }),
+  );
+  assert.equal(storage?.reason, "the last storage check did not restore progress");
+
+  // A non-parking action still names its budget: that counter is the real one.
+  const repair = capped({ recoveryAction: "CREATE_REPAIR_TASKS", recoveryStatus: "failed" });
+  assert.equal(repair?.reason, "recovery attempt 9 of 8 did not restore progress");
+});
+
+/**
+ * #501 F-B. During `gateBackoff` the mission is REPAIRING, its probe decision is
+ * open, and nothing runs until the probe fires. That is not a park and the gate
+ * is not running, so the wait wording would be false — but silence reads as
+ * "active, nothing to know".
+ */
+test("a repair gate between probes says what it waits for instead of nothing (#501 F-B)", () => {
+  const repairing = deriveAttention(
+    base({
+      state: "REPAIRING",
+      health: "active",
+      recovery: { attempt: 2, maxAttempts: 8 },
+      recoveryAction: "PROBE_AND_BACKOFF",
+      recoveryStatus: "started",
+      failureCategory: "PROVIDER_TRANSIENT",
+    }),
+  );
+
+  assert.equal(repairing?.severity, "low", "worth a row, not an interruption");
+  assert.match(repairing!.reason, /repair gate re-running/);
+  assert.doesNotMatch(repairing!.reason, /waiting|parked|exhausted/, "the gate may be running right now");
+
+  // The same note covers the at-cap REPAIRING case, which also rendered nothing.
+  const atCap = capped({ state: "REPAIRING", health: "active", failureCategory: "PROVIDER_TRANSIENT" });
+  assert.equal(atCap?.severity, "low");
+  assert.match(atCap!.reason, /repair gate re-running/);
+
+  // A stronger fact still outranks it, and an unrelated REPAIRING mission stays silent.
+  const looping = deriveAttention(
+    base({
+      state: "REPAIRING",
+      health: "active",
+      recovery: { attempt: 2, maxAttempts: 8 },
+      recoveryAction: "PROBE_AND_BACKOFF",
+      recoveryStatus: "started",
+      loopSignals: [{ kind: "repeated_tool_call", detail: "bash npm test", count: 9 }],
+    }),
+  );
+  assert.equal(looping?.evidence[0]?.kind, "loop");
+  assert.equal(deriveAttention(base({ state: "REPAIRING", health: "active" })), null);
+});
+
 test("a settled or actively-rerunning decision is not rendered as a wait (#497 F1)", () => {
   for (const recoveryStatus of ["planned", "started"] as const) {
     const wait = capped({ failureCategory: "PROVIDER_TRANSIENT", recoveryStatus });

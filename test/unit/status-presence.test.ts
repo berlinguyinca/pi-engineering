@@ -221,6 +221,34 @@ test("a row whose evidence says why carries the reason", () => {
   assert.ok(!quiet.includes("· " + "repeated"), quiet);
 });
 
+/**
+ * #501 "Also". The parking-wait wording carries the clause that tells the
+ * operator how the wait ends. Both row cuts dropped it, so a parked mission
+ * read as an unbounded wait with no operator action in it.
+ */
+test("a compact row keeps the clause that ends a parking wait (#501 also)", () => {
+  const reason =
+    "waiting for capacity: probe 195; resumes once the gateway probe succeeds, unless paused or stopped; parked 1h 0m, next probe in 2m";
+  const parked = mission({
+    missionId: "MSN-parked",
+    state: "BLOCKED",
+    health: "blocked",
+    attention: { severity: "high", reason, evidence: [{ kind: "capacity_wait", detail: reason }] },
+  });
+
+  const view = projectPresence([parked], 4, T);
+  const row = row0(view);
+  assert.ok(row.attentionReason?.endsWith("unless paused or stopped"), row.attentionReason);
+  assert.ok((row.attentionReason ?? "").length <= 80, "the working-line budget still holds");
+
+  const line = lineAt(renderWidgetLines(view), 1);
+  assert.match(line, /unless paused or stopped/, "the strip row keeps the caveat");
+  const attention = line.slice(line.lastIndexOf(" · "));
+  assert.ok(attention.length <= 47, `the row's attention part keeps its budget: ${attention.length}`);
+  // The working line leads with the same evidence, caveat included.
+  assert.match(view.workingLine ?? "", /unless paused or stopped/);
+});
+
 test("a mission with no observability state still renders, without a percentage", () => {
   const row = row0(
     projectPresence([storeOnlyEvent({ mission_id: "MSN-9", title: "queued leg", status: "QUEUED" })], 4, T),
