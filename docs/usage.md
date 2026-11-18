@@ -233,6 +233,11 @@ with these exceptions:
 - A reviewer may run on the pinned model when that model did not produce the
   work. The pinned model is usually also your interactive model.
 
+A pin is a choice about inference, not about permission: if you pin a model the
+operator marked review-only (`models.review_only`), the
+[review-only model guard](#review-only-model-guard) blocks that session's own
+writes, commits and merges.
+
 **Scope.** The pin belongs to the Pi process, not to one conversation. The
 runtime session id is a single id per process, so every mission that process
 starts or resumes counts as "this session's". `/new` clears the pin for all of
@@ -1162,6 +1167,73 @@ mutating form is a gap to close when it bites, not a contract hole. `git -C`,
 The runtime's own in-process git operations (mission workers run in candidate
 worktrees; integration, janitor) do not go through the tool-call hook and are
 unaffected.
+
+## Review-only model guard
+
+Mission roles are routed by capability, and a reviewer role is read-only **by
+routing** (`readOnly` / `independent` in `src/lifecycle/types.ts`). An
+interactive or handoff-resumed session skips that routing: it runs on whatever
+`/model` pinned, and nothing reconciled the pin with "may this model mutate".
+That gap is how a session pinned to a review-only model implemented and merged
+a change it should only have reviewed (#725, squash `599c06d0`).
+
+`src/guard/reviewOnlyModelGuard.ts` (on the `tool_call` hook, **opt-in**) blocks
+the session's own mutating calls while its model is on the review-only list:
+
+- `write` / `edit`;
+- bash `git` commands that change repository state — the same verb list the
+  primary worktree guard judges, with the culprit segment named;
+- bash writes (`> f`, `>> f`, `tee f`, `sed -i … f`, `mv`/`cp`);
+- `gh pr merge`, the step that actually landed the incident, and the one
+  non-git verb this guard knows. `gh pr view|checks|review` stay allowed:
+  reviewing is what such a model was pinned for.
+
+Read-only tools, `git status`/`log`/`diff`/`fetch`, `git worktree` management,
+tests, builds and linters stay allowed — a reviewer has to be able to run the
+code it is reviewing. `gh pr merge` is recognised at a command position, so
+`echo "then gh pr merge --squash"` and `grep 'gh pr merge' docs/` are prose
+about a command, not a merge.
+
+**Which model.** The call's own `ctx.model`, which Pi resolves at call time, so
+a mid-session `/model` switch is seen by the next call. `PI_MODEL` /
+`PI_PROVIDER` are only the fallback: Pi sets those on a bash **child's**
+environment, not on its own `process.env`, so a session's own environment
+carries them only when it inherited them from whatever launched it — for a pane
+started out of another Pi session, that is the *parent's* model. Every block
+reason names the model it judged, so an inherited value is visible rather than
+silently in control. A model with no provider stated never matches a
+`provider/id` entry: without proof of *which* model this is, the guard does not
+block.
+
+Configuration (a list of `provider/id`, or a bare `id` that matches that id
+behind any provider; ids compare as written):
+
+```yaml
+# <agent dir>/engineering.yaml
+models:
+  review_only:
+    - anthropic/claude-opus-4-8
+```
+
+Knobs:
+
+- `PI_ENG_REVIEW_ONLY_MODELS` — comma-separated list that **replaces** the file's
+  (an operator's live override, read at activation).
+- `PI_ENG_REVIEW_ONLY_GUARD=0` — disable the guard entirely, for a session that
+  must implement on such a model. The block reason says so.
+
+No list means no control effect, so the default is inert and existing sessions
+are unaffected. A `models:` block that is malformed — a scalar instead of a
+list, a non-string or non-`id` entry, a key this loader does not own — turns the
+layer **off** and prints a note, rather than guarding some of the models the
+operator meant to guard. The file is read asynchronously after activation, so
+the guard is inert for the first milliseconds of a session and armed when the
+read lands; the env list is live immediately.
+
+The bash checks are best-effort, as in the primary worktree guard: an
+unrecognized mutating form is a gap to close when it bites. Sessions the runtime
+spawns (mission workers) load the same extension, so a model on this list cannot
+implement there either.
 
 ## Task Contract gate (task discipline)
 
