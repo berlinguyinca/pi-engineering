@@ -272,3 +272,50 @@ pi -p -e 'what did we record about <topic>?'  # memory block present, not "0 rec
 A `not-installed` host stays fail-closed (reads degrade to "no memory"), but is reported
 loudly and re-probed on the short failure backoff rather than being hidden behind the
 300 s unavailable pause.
+
+### Preflight: "not provisioned" vs "slow read" (2026-11-18, #717)
+
+The failure taxonomy above classifies *one call*. It cannot answer the question an operator
+actually asks — "is this host provisioned, or was memory just slow this turn?" — because a
+timeout is evidence about the call, not about the host. Measured on this deployment:
+steady-state recall 0.28–0.42 s, the cold spike recorded above 4.06 s (~13x apart), and
+8-way contention moves it by ~10% (331 ms vs 302 ms idle). So "timed out" was never
+information about provisioning, yet it printed as if it were.
+
+`src/blackhole/memoryPreflight.ts` answers it with four checks, each one an existing
+contract of the pinned CLI (all four verified against the real client on 2026-11-18 and
+pinned in `test/unit/hindsight-preflight.test.ts`):
+
+| Check | Call | Proves |
+| --- | --- | --- |
+| `client` | `--version` | the binary exists, and what it says its client/contract is |
+| `config` | `validate-config` | the CLI's own config parses (nothing called this before) |
+| `credentials:<tenant>`, `server`, `outbox`, `dead_letter` | `doctor` | credential readability + private permissions, reachability, write queue |
+| `bank:<scope>` | `documents --kind fact --scope S --limit 1` | the scope resolves to an engineering bank, i.e. section 5 above ran |
+
+`fail` means **retrying will not fix this** (missing binary, unusable config, refused
+credential, missing bank) and sets `provisioningGap`. `warn` means the check learned
+nothing — including nothing about the host being broken — so a slow host is never reported
+as an unprovisioned one. Checks run cheapest first and stop after a missing binary, because
+every later check would report the same absent executable and read like four problems.
+The client version is reported, never compared against a pin: the pin lives in the install
+script, and a second copy here would rot and then lie.
+
+Where the operator sees it:
+
+- `/memory status` prints the connection probe plus one line per check and a verdict line
+  (`Every check answered — nothing to install or configure on this host.` or
+  `Failing checks: …  Fix them … — retrying will not.`). One composed answer per command,
+  including headless.
+- A failed automatic read or `/memory <query>` adds one explanation per memory host per
+  episode (5 min, `PREFLIGHT_EXPLAIN_MS`): either
+  `Memory is not provisioned on this host: <first failing check> Retrying will not fix that.`
+  or `Memory is provisioned and reachable — every preflight check answered. The read that
+  just failed was slow or transient, so memory retries on its own.`
+- Headless uses the same once-per-day telemetry channel as the failure notice, under the
+  keys `memory:preflight:not-provisioned` and `memory:preflight:slow-read`, so print-mode
+  transcripts stay clean.
+
+A settled read clears the episode, so the next failure explains itself again. Reports are
+reused for 60 s (`PREFLIGHT_REUSE_MS`) so an explicit `/memory status` right after a
+failure does not re-spawn what just ran.

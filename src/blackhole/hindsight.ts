@@ -72,7 +72,8 @@ const MAX_DOCUMENT_PAGES = 3;
 const MAX_LIST_RECORDS = 50;
 const ADDRESS_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
-function engineeringBank(bank: unknown, scope?: string): bank is string {
+/** True for banks in the engineering namespaces (never personal-assistant memory). */
+export function engineeringBank(bank: unknown, scope?: string): bank is string {
   if (typeof bank !== "string" || /^(personal|rakazo|assistant)/i.test(bank)) return false;
   if (scope === "global") return bank === "herdr-global";
   if (scope === "infra") return bank === "herdr-infra";

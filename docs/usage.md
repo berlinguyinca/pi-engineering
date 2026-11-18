@@ -1629,8 +1629,11 @@ when headless), then automatic recall and saves stay silent best-effort until th
 `unavailable_backoff_ms` window passes. The once-per-session connection check waits
 up to 5 s (a healthy cold client takes seconds, and a status line that says "timed
 out" about a working service teaches people to ignore it), while an interactive turn
-waits `automatic_recall_ms` and a headless run 5 s. Run `/memory` (or
-`herdr-memory doctor`) to see what is wrong.
+waits `automatic_recall_ms` and a headless run 5 s. Run `/memory status` to see what is
+wrong: it answers the CLI's own `--version`, `validate-config`, `doctor` and one bank
+listing per scope, and prints one line per check with a verdict — "is this host
+provisioned" (`fail` = retrying will not fix it) is a different answer from "this read was
+slow" (`warn`), and the failure notices now say which one happened.
 A turn never proceeds in silence: if the budget expires the model is told memory
 "could not be read this turn … unavailable, not empty", and an answer that arrives
 late is used by the next model call of the same turn. The measurements behind these numbers are in
