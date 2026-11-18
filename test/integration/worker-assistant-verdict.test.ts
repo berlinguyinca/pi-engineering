@@ -34,7 +34,12 @@ const MODEL_GONE = `data: ${JSON.stringify({
 
 async function withRefusingGateway<T>(
   run: (executor: PiWorkerExecutor, cwd: string, requests: () => number) => Promise<T>,
+  options: { endStream?: boolean; dirPrefix?: string } = {},
 ) {
+  // A gateway that refuses and then hangs up, and one that refuses and never
+  // closes the socket, are different failures for a worker: only the frame can
+  // end the second one (#718).
+  const endStream = options.endStream !== false;
   let requests = 0;
   const server = createServer((req, res: ServerResponse) => {
     req.resume(); // consume the body, as a real gateway does
@@ -42,12 +47,12 @@ async function withRefusingGateway<T>(
       requests++;
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(MODEL_GONE);
-      res.end("data: [DONE]\n\n");
+      if (endStream) res.end("data: [DONE]\n\n");
     });
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
-  const dir = mkdtempSync(join(tmpdir(), "pi-assistant-verdict-"));
+  const dir = mkdtempSync(join(tmpdir(), options.dirPrefix ?? "pi-assistant-verdict-"));
   writeFileSync(
     join(dir, "models.json"),
     JSON.stringify({
@@ -71,6 +76,8 @@ async function withRefusingGateway<T>(
   try {
     return await run(executor, dir, () => requests);
   } finally {
+    // A wedged reply leaves the connection open; close() would wait for it.
+    server.closeAllConnections();
     server.close();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -100,4 +107,64 @@ test("an assistant-message model_not_found ends the run with the takeover marker
   assert.deepEqual(details.model, { provider: "probe", id: "probe-model" });
   assert.ok(elapsed < 60_000, `the verdict must end the run, not the 300s window (${elapsed}ms)`);
   assert.ok(requests <= 8, `the verdict must end the run, not keep re-issuing turns (${requests} requests)`);
+});
+
+/**
+ * #718 — the acceptance test #457 left pinned as `todo`, with its assertion
+ * corrected to what the fix actually promises. The pinned form demanded the run
+ * classify as a *stall*; that was the expectation of the rejected remedy (clamping
+ * the first-token window, measured 5.5x slower). The contract that matters is
+ * time to failure and the provider's own reason: a refusal the gateway already
+ * sent must end the run inside the run's own budget, with its wording, and
+ * without further turns.
+ *
+ * Time is asserted, not only classification — that is what killed the clamp.
+ */
+test("a refusal that never yields a token ends the run inside its own budget (#718)", async () => {
+  const started = Date.now();
+  const { elapsed, error, summary, requests } = await withRefusingGateway(async (executor, cwd, count) => {
+    const run = await executor.run({
+      role: "implementer",
+      task: "t",
+      tools: [],
+      cwd,
+      modelOverride: { provider: "probe", id: "probe-model" },
+      timeoutMs: 5_000,
+    });
+    return { elapsed: Date.now() - started, error: run.error, summary: run.result.summary, requests: count() };
+  });
+
+  assert.notEqual(error, "timeout", `the clock ended the run, not the refusal: ${summary}`);
+  assert.equal(error, "transient:model_unavailable", `summary: ${summary}`);
+  assert.match(summary, /model_not_found/, "the provider's own wording must reach the operator");
+  assert.ok(elapsed < 5_000, `the refusal must end the run, not the budget (${elapsed}ms)`);
+  assert.ok(requests <= 3, `a refused run must not keep issuing turns (saw ${requests} requests)`);
+});
+
+/**
+ * The hang #718 describes, in its truest shape: the frame arrives and the socket
+ * is never closed, so no stream end, no finish_reason and no token ever follow.
+ * Without a terminal verdict on the frame the run can only die on the clock.
+ */
+test("a refusal on a socket that never closes still ends the run (#718)", async () => {
+  const started = Date.now();
+  const { elapsed, error, summary, requests } = await withRefusingGateway(
+    async (executor, cwd, count) => {
+      const run = await executor.run({
+        role: "implementer",
+        task: "t",
+        tools: [],
+        cwd,
+        modelOverride: { provider: "probe", id: "probe-model" },
+        timeoutMs: 5_000,
+      });
+      return { elapsed: Date.now() - started, error: run.error, summary: run.result.summary, requests: count() };
+    },
+    { endStream: false },
+  );
+
+  assert.notEqual(error, "timeout", `the clock ended the run, not the refusal: ${summary}`);
+  assert.equal(error, "transient:model_unavailable", `summary: ${summary}`);
+  assert.ok(elapsed < 5_000, `an unclosed socket must not hold the run (${elapsed}ms)`);
+  assert.ok(requests <= 3, `a refused run must not keep issuing turns (saw ${requests} requests)`);
 });
