@@ -431,6 +431,10 @@ describe("ExecutionBroker: recovering a timed-out worker's committed work", () =
       // pipeline-311 evidence.
       const hostScale = await measureRoundTripMs(artifacts);
       const budgetMs = scaledBudgetMs(hostScale.unitMs);
+      if (budgetMs > 6_000)
+        console.info(
+          `# host scale: ${hostScale.unitMs}ms per ${hostScale.measured} -> budget stretched to ${budgetMs}ms`,
+        );
       const validArtifact = await artifacts.put("checkpoint", "implementation", "verified artifact body", "proof");
       const secondValidArtifact = await artifacts.put("checkpoint", "tests", "verified artifact body", "proof");
       const base = await git.headCommit();
