@@ -51,14 +51,14 @@ after(async () => {
 
 test("package.json points Pi at the entry shim", () => {
   const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as { pi: { extensions: string[] } };
-  // The shim is the Pi Engineering entry and must stay first. The only other entry is the
-  // vendored, default-off pi-split-view terminal layout (extensions/split-view/VENDORED.md).
-  assert.deepEqual(pkg.pi.extensions, ["./src/runtime/host/entry.ts", "./extensions/split-view/split-view.ts"]);
+  // The shim is the only Pi Engineering entry point: nothing else is handed to Pi.
+  assert.deepEqual(pkg.pi.extensions, ["./src/runtime/host/entry.ts"]);
 });
 
 test("a Host that throws at import: Pi still gets Pi Engineering (legacy), and /engineering says why", async () => {
   const copy = join(root, "package-broken-import");
   await cp(join(repoRoot, "src"), join(copy, "src"), { recursive: true });
+  // The legacy extension the shim falls back to lives outside src/.
   await cp(join(repoRoot, "extensions"), join(copy, "extensions"), { recursive: true });
   await cp(join(repoRoot, "package.json"), join(copy, "package.json"));
   await symlink(join(repoRoot, "node_modules"), join(copy, "node_modules"), "dir");
