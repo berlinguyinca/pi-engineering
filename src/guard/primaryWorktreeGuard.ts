@@ -82,7 +82,7 @@ export function resolvePrimaryWorktreeGuardConfig(env: NodeJS.ProcessEnv = proce
 }
 
 /** Split a shell command into segments at the usual separators. */
-function segments(command: string): string[] {
+export function segments(command: string): string[] {
   return command
     .split(/&&|\|\||[;|\n]/)
     .map((s) => s.trim())
@@ -111,7 +111,7 @@ const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--n
  * them (`'git`, `$(git`, `commit"`), so quoting does not hide an invocation
  * and a quoted verb still reads as a verb.
  */
-function tokenize(segment: string): string[] {
+export function tokenize(segment: string): string[] {
   return segment
     .split(/\s+/)
     .filter(Boolean)
@@ -141,7 +141,7 @@ function isGitCommand(word: string): boolean {
 const COMMAND_PREFIXES = new Set(["sudo", "env", "command", "time", "do", "then", "else", "!", "(", "{"]);
 
 /** True when `tokens[i]` is where a command name may sit (after `FOO=bar sudo …`). */
-function atCommandPosition(tokens: string[], i: number): boolean {
+export function atCommandPosition(tokens: string[], i: number): boolean {
   for (let j = i - 1; j >= 0; j--) {
     const prev = tokens[j];
     if (prev === undefined || COMMAND_PREFIXES.has(prev) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev)) continue;
