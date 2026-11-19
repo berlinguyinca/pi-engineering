@@ -49,20 +49,32 @@ Two things it deliberately does not do:
 
 ### Watching the gate
 
-The status appears a few seconds after the push. Read it with either of:
+Read the gate through the pull request rollup, which is where it shows up first:
 
 ```bash
-gh pr checks <n>            # lists ci/woodpecker/pr/ci once the pipeline has reported
+gh pr checks <n> --watch --interval 60     # blocks until every check completes
+gh pr view <n> --json statusCheckRollup \
+  -q '.statusCheckRollup[] | "\(.context // .name) \(.state // .conclusion)"'
 gh api repos/berlinguyinca/pi-engineering/commits/<head-sha>/status \
   -q '.statuses[] | "\(.context) \(.state) \(.target_url)"'
 ```
 
-`no checks reported on the '<branch>' branch` right after pushing or opening a PR means
-**not reported yet**, never *there is no CI*. Sampled once at t+2s it has never been
-evidence of absence: on #729 the same command printed that, and minutes later it printed
-`ci/woodpecker/pr/ci pass` with a link to the run. Wait for it — `gh pr checks <n> --watch`,
-or one long-interval poll of the status endpoint — instead of concluding from the first
-sample, and do not re-poll at short intervals.
+An empty read from any of these — including `no checks reported on the '<branch>' branch` —
+means **not reported yet**, never *there is no CI*. Sampled once, it has never been evidence
+of absence: on #729 the first sample printed exactly that line, and the same command minutes
+later printed `ci/woodpecker/pr/ci pass` with a link to the run.
+
+The endpoints disagree about *when* the status exists. Measured on #732 (head `daff7cb8`,
+pipeline 333): `gh pr checks --watch` walked `pending` → `pass` and `statusCheckRollup`
+reported SUCCESS, while `commits/<head>/status` still returned an empty `statuses` array at
+t+45s and again at t+225s and carried the status only later. And a run can queue a long time:
+the next head of that same PR (`53c829f6`, pipeline 335) sat `pending` for 43 minutes while
+push pipelines on `main` finished in minutes — the hive pool is shared, so a pending pipeline
+is a queue, not a verdict.
+
+So wait: `gh pr checks <n> --watch`, or one long-interval check of the rollup. Do not
+conclude from the first sample, do not re-poll at short intervals, and do not merge on local
+verification alone because the gate has not reported yet.
 
 The absence of `.github/` is not evidence about CI here either. GitHub Actions is disabled
 on this repository (`actions/permissions` → `enabled: false`) because `85b1b06` removed the
