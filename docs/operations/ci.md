@@ -47,6 +47,31 @@ Two things it deliberately does not do:
   review requirements. A PR can be blocked by either, and the reasons are reported
   separately.
 
+### Watching the gate
+
+The status appears a few seconds after the push. Read it with either of:
+
+```bash
+gh pr checks <n>            # lists ci/woodpecker/pr/ci once the pipeline has reported
+gh api repos/berlinguyinca/pi-engineering/commits/<head-sha>/status \
+  -q '.statuses[] | "\(.context) \(.state) \(.target_url)"'
+```
+
+`no checks reported on the '<branch>' branch` right after pushing or opening a PR means
+**not reported yet**, never *there is no CI*. Sampled once at t+2s it has never been
+evidence of absence: on #729 the same command printed that, and minutes later it printed
+`ci/woodpecker/pr/ci pass` with a link to the run. Wait for it — `gh pr checks <n> --watch`,
+or one long-interval poll of the status endpoint — instead of concluding from the first
+sample, and do not re-poll at short intervals.
+
+The absence of `.github/` is not evidence about CI here either. GitHub Actions is disabled
+on this repository (`actions/permissions` → `enabled: false`) because `85b1b06` removed the
+workflows when Actions billing started failing; this pipeline replaced them. The pipeline
+definitions in `.woodpecker/` are source like any other: `test/unit/woodpecker-variable-refs.test.ts`
+fails when a pipeline pins a Node version and digest that differ from the others, or asks
+Woodpecker to expand a variable it does not know, so a change to `ci.yaml` goes through a PR
+and this suite, not through the server UI.
+
 ## The pipeline provisions its own Node
 
 ```
