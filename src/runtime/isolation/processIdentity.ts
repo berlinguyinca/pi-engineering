@@ -32,7 +32,7 @@ export type ProcessLiveness =
 // carry a Linux-only copy, which assessed any record that carried an incarnation
 // as `pid_not_alive` on macOS — a proof of death, and therefore a licence to
 // reclaim a live session's lease — because procfs simply is not there.
-import { readBootId, readProcessStartTime } from "../../platform/processIncarnation.ts";
+import { readBootId, readProcessStartTime, startTimesMatch } from "../../platform/processIncarnation.ts";
 
 export { readBootId, readProcessStartTime };
 
@@ -88,7 +88,7 @@ export function assessProcess(owner: ProcessIdentity): ProcessLiveness {
     const start = readProcessStartTime(owner.pid);
     if (start.state === "missing") return { state: "dead", reason: "pid_not_alive" };
     if (start.state === "present") {
-      return start.value === owner.processStartTime
+      return startTimesMatch(owner.processStartTime, start.value)
         ? { state: "alive", reason: "incarnation_matches" }
         : { state: "dead", reason: "pid_reused" };
     }

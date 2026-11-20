@@ -19,6 +19,7 @@ import {
   type ProcessStartTime,
   readBootId as readBootIdShared,
   readProcessStartTime as readProcessStartTimeShared,
+  startTimesMatch,
 } from "../processIncarnation.ts";
 
 export interface FileLockOwner {
@@ -137,7 +138,7 @@ function ownerState(owner: FileLockOwner): "live" | "stale" | "unknown" {
   const start = readProcessStartTime(owner.pid);
   if (start.state === "missing") return "stale";
   if (start.state === "unknown") return "unknown";
-  return start.value === owner.processStartTime ? "live" : "stale";
+  return startTimesMatch(owner.processStartTime, start.value) ? "live" : "stale";
 }
 
 /**
