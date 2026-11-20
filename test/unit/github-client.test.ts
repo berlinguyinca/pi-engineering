@@ -307,3 +307,64 @@ describe("execGh: real process, no shell", () => {
     }
   });
 });
+
+describe("#722: commit statuses are read, not just check runs", () => {
+  const sha = "a".repeat(40);
+
+  it("calls the statuses endpoint and normalizes the rows GitHub returns", async () => {
+    // `gh api --paginate --slurp` wraps each response page in an array, and the
+    // statuses endpoint has no envelope key the way check-runs has `check_runs`.
+    const { run, calls } = scripted([
+      json([
+        [
+          {
+            context: "ci/woodpecker/pr/ci",
+            state: "success",
+            sha,
+            description: "Pipeline was successful",
+            target_url: "https://ci.metabolomics.us/repos/121/pipeline/341/1",
+            created_at: "2026-11-20T02:00:00Z",
+            updated_at: "2026-11-20T02:12:00Z",
+          },
+          { context: "ci/pending", state: "pending" },
+          { state: "success" },
+          "not an object",
+        ],
+      ]),
+    ]);
+    const statuses = await new GhCliClient(config, run).listCommitStatuses!(ref("#1"), sha.toUpperCase());
+    assert.ok(
+      calls[0]!.argv.includes(`repos/acme/widgets/commits/${sha}/statuses`),
+      `argv: ${calls[0]!.argv.join(" ")}`,
+    );
+    assert.deepEqual(statuses, [
+      {
+        context: "ci/woodpecker/pr/ci",
+        state: "success",
+        sha,
+        description: "Pipeline was successful",
+        target_url: "https://ci.metabolomics.us/repos/121/pipeline/341/1",
+        created_at: "2026-11-20T02:00:00Z",
+        updated_at: "2026-11-20T02:12:00Z",
+      },
+      {
+        context: "ci/pending",
+        state: "pending",
+        sha: "",
+        description: "",
+        target_url: "",
+        created_at: "",
+        updated_at: "",
+      },
+    ]);
+  });
+
+  it("refuses a sha that is not a sha before touching gh", async () => {
+    const { calls } = scripted([]);
+    await assert.rejects(
+      new GhCliClient(config, scripted([]).run).listCommitStatuses!(ref("#1"), "--help"),
+      (e: GithubClientError) => e.kind === "invalid",
+    );
+    assert.equal(calls.length, 0);
+  });
+});

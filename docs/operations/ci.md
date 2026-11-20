@@ -84,6 +84,40 @@ fails when a pipeline pins a Node version and digest that differ from the others
 Woodpecker to expand a variable it does not know, so a change to `ci.yaml` goes through a PR
 and this suite, not through the server UI.
 
+### How the runtime reads the same gate (#722)
+
+The merge gate in `src/github/sync.ts` reads **both** GitHub surfaces for the head commit:
+`/commits/<sha>/check-runs` (`GithubClient.listCheckRuns`) and `/commits/<sha>/statuses`
+(`GithubClient.listCommitStatuses`), merged by `normalizeCheckRuns()` in
+`src/merge/checkRunIngest.ts`. That second call is the whole of #722: Woodpecker publishes a
+commit **status** named `ci/woodpecker/pr/ci` and never a check run, so before it existed the
+gate saw only GitGuardian — a head with one green scanner and a pipeline that had never started
+looked like CI evidence, and `mergeable: MERGEABLE` read as green.
+
+The rules the ingestion applies:
+
+- An unknown status state is a **failure**, never a pass (`commitStatusState`).
+- The newest entry per context wins, keyed on `updated_at` then `created_at`, so a superseded
+  run reporting `error` cannot mask the rerun that passed.
+- A status or check run reported for a **different commit** reaches the gate, which rejects the
+  merge (`check <name> sha … != head`) instead of dropping the row.
+- A statuses call that cannot be answered counts as unreadable checks: the decision is `wait`
+  with `no CI evidence: the checks could not be read`, never "no checks needed".
+
+Name the pipeline in `github.required_checks` (`engineering.yaml`, see
+`src/github/settings.ts`):
+
+```yaml
+github:
+  enabled: true
+  required_checks: [ci/woodpecker/pr/ci]
+```
+
+Without it the required set defaults to *the checks that reported*, which cannot notice an
+absence — a pipeline that never started contributes no name to the set, so nothing waits for
+it. With it, absence is a wait (`required check ci/woodpecker/pr/ci missing`) and a pending
+pipeline is a wait, which is the fail-closed reading of the empty output described above.
+
 ## The pipeline provisions its own Node
 
 ```

@@ -6,7 +6,10 @@
  *     hosts: [github.com]              # accepted hosts
  *     default_repo: owner/name         # resolves bare #N
  *     gh_path: /usr/bin/gh             # the gh executable
- *     required_checks: [ci]            # checks the merge gate waits for (default: every check on the head)
+ *     required_checks: [ci]            # checks the merge gate waits for (default: every check that reported)
+ *                                      # Name the CI run: a pipeline that never started reports nothing, and
+ *                                      # an unnamed check cannot be waited for. Woodpecker reports the commit
+ *                                      # status `ci/woodpecker/pr/ci` (#722).
  *     rereview_command: [/opt/bin/request-review]   # argv; Pi appends --pr <id> --head <sha> --signal <id>
  *
  * Anything malformed or unsafe turns the layer off with a note.
