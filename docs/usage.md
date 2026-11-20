@@ -1812,10 +1812,25 @@ made every existing store unopenable and the whole runtime answered
 lock root identity changed`; a store stamped with an old device now heals itself
 the first time it is opened, so no manual repair is needed.
 
+The same doctrine applies to the **pathname-pinned fallback** macOS runs on, where
+the store cannot ask the kernel to keep an operation on a pinned inode and instead
+re-states the directory's name and compares (#731). That comparison used to require
+`st_dev` equality, so it refused a healthy store *before* the classifier above ever
+ran — the contradiction the issue reports. It now refuses when the name resolves to
+**another inode** (`PATH_PIN_SUBSTITUTED`, with both identities printed) and treats
+same-inode/different-device as the mount generation the record already calls it.
+Substitution stays covered: the lock root must still carry its own domain token, be
+mode `0700` owned by the current user, and match the inode the durable record names.
+
 When the runtime cannot open for a directory, the `mission` tool and `/mission`
 (including `/mission cancel`) report why:
 `Orchestrator not initialized for this directory: <reason>`. The tool also
-returns a `details.diagnostics` entry with code `orchestrator_init_failed`.
+returns a `details.diagnostics` entry with code `orchestrator_init_failed`. A
+refusal that a re-stamp can heal (`LOCK_DOMAIN_RESTAMP_CONFLICT`) names
+`pi-engineering doctor --repair` in its own message; one that cannot be healed —
+a substituted inode, a foreign domain token, a group-writable root — says so and
+leaves the record exactly as it found it, because adopting an identity the store
+cannot prove continuity with is the one thing the domain token exists to prevent.
 
 The ledger is event-sourced and replayed on open, so **no run depends on the
 interactive transcript surviving** — you can close and reopen pi and `/ledger`

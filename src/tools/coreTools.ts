@@ -161,9 +161,8 @@ function awaitingUser(store: Orchestrator["store"], mission: Mission): string | 
 
 /** What a tool reports when its runtime service is unavailable for the cwd, with the reason when known. */
 export function notInitializedText(subject: string, reason: string | null | undefined): string {
-  return reason
-    ? `${subject} not initialized for this directory: ${reason}`
-    : `${subject} not initialized for this directory.`;
+  if (!reason) return `${subject} not initialized for this directory.`;
+  return `${subject} not initialized for this directory: ${reason}`;
 }
 
 export function buildCoreTools(

@@ -47,7 +47,8 @@ export type LockDomainFailureCode =
   | "LOCK_DOMAIN_RESTAMP_CONFLICT"
   | "LOCK_DOMAIN_TOKEN_MISMATCH"
   | "LOCK_ROOT_INODE_CHANGED"
-  | "LOCK_ROOT_UNSAFE";
+  | "LOCK_ROOT_UNSAFE"
+  | "PATH_PIN_SUBSTITUTED";
 
 /** An integrity failure that diagnostics can classify without string matching. */
 export class ArtifactIntegrityError extends Error {
@@ -161,6 +162,42 @@ export function classifyLockDomainDrift(args: {
   if (identity.dev !== record.device) {
     return { kind: "mount_generation", from: record.device, to: identity.dev };
   }
+  return { kind: "match" };
+}
+
+/** A directory identity as a stat reports it: the mount it resolved through and its inode. */
+export interface PathIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+/**
+ * How the *name* a pinned directory was opened through relates to the
+ * descriptor that was opened under it.
+ *
+ * Hosts with descriptor-relative projection (Linux `/proc/self/fd`) never need
+ * this: the kernel keeps the operation on the pinned inode. Everywhere else the
+ * store can only re-state the pathname and compare, so the comparison has to
+ * say which difference it saw rather than collapse both into "identity
+ * changed" — that collapse is what made a healthy store unopenable after a
+ * mount generation (#731).
+ */
+export type PathIdentityDrift =
+  /** The name still resolves to exactly the pinned directory. */
+  | { kind: "match" }
+  /**
+   * Same inode, different device: the same directory reached through a new mount
+   * generation. Identity is the inode; `st_dev` is a mount-generation stamp (see
+   * the file header), so this is not a substitution.
+   */
+  | { kind: "mount_generation"; from: bigint; to: bigint }
+  /** The name resolves to a different directory: a substitution, always fatal. */
+  | { kind: "substituted"; expected: PathIdentity; actual: PathIdentity };
+
+/** Classify a pathname-vs-descriptor comparison of the same directory. */
+export function classifyPathIdentity(expected: PathIdentity, actual: PathIdentity): PathIdentityDrift {
+  if (actual.ino !== expected.ino) return { kind: "substituted", expected, actual };
+  if (actual.dev !== expected.dev) return { kind: "mount_generation", from: expected.dev, to: actual.dev };
   return { kind: "match" };
 }
 
