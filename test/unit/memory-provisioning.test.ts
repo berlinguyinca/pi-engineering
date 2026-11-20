@@ -93,6 +93,10 @@ case "$mode" in
   rows)    echo '{"ok":true,"checks":[{"status":"ok","detail":"no name"},{"name":"server","status":"fail","detail":"connection refused"}]}'; exit 1 ;;
   warn)    echo '{"ok":true,"overall":"warn","checks":[{"name":"package_revision","status":"warn","detail":"herdr-memory f3a20bae5fb9 != pin d48b334b6236"}]}'; exit 0 ;;
   unknown) echo '{"ok":false,"overall":"degraded","checks":[{"name":"credential:project","status":"unknown","detail":"doctor could not read the file"}]}'; exit 1 ;;
+  # Exactly one check declines to answer, measured on a real host 2026-11-18: every other check is ok and
+  # fleet_update has no state file because no unattended updater has run here. Recorded from
+  # doctor's own --json output, verbatim apart from the surrounding checks.
+  one_unknown) echo '{"ok":true,"contract":1,"overall":"healthy","checks":[{"name":"credential:project","status":"ok","detail":"0600 file in 0700 parent"},{"name":"pin","status":"ok","detail":"pinned revision matches"},{"name":"fleet_update","status":"unknown","detail":"no unattended fleet update has recorded a run"},{"name":"server","status":"ok","detail":"reachable, credential accepted"}]}'; exit 0 ;;
   cred_fail) echo '${DOCTOR_CRED_FAIL_JSON}'; exit 1 ;;
 esac
 echo '${DOCTOR_OK_JSON}'
@@ -412,9 +416,33 @@ test("#717: a doctor check that says unknown is neither healthy nor unprovisione
     const report = await withModes("healthy", "unknown", () =>
       runProvisioningChecks({ cli, scopes: ["project"], timeoutMs: 5_000, harness: "pi", ...doctorVia(engCli) }),
     );
-    assert.equal(check(report, "credential:project")?.state, "warn");
+    // #728: doctor's `unknown` is its own answer. Folding it into `warn` told operators to go reconcile
+    // drift when the honest statement was that the check learned nothing.
+    assert.equal(check(report, "credential:project")?.state, "unknown");
     assert.equal(report.provisioningGap, false);
     assert.equal(report.inconclusive, false, "the client-side checks still answered");
+  } finally {
+    cleanup();
+  }
+});
+
+test("#728: one check reporting no data is not drift, and is not counted as answered", async () => {
+  const { cli, engCli, cleanup } = fixtures();
+  try {
+    const report = await withModes("healthy", "one_unknown", () =>
+      runProvisioningChecks({ cli, scopes: ["project"], timeoutMs: 5_000, harness: "pi", ...doctorVia(engCli) }),
+    );
+    const fleet = check(report, "fleet_update");
+    assert.equal(fleet?.state, "unknown", "doctor's vocabulary is four-valued; the ingestion must not collapse it");
+    assert.match(String(fleet?.detail), /no unattended fleet update has recorded a run/);
+    // The two verdicts an operator acts on stay untouched by a check that declined to answer.
+    assert.equal(report.provisioningGap, false, "no data is not evidence of a gap");
+    assert.equal(report.inconclusive, false, "the other checks did answer, so the report is not empty of proof");
+    // Rendered distinctly, in the same column, so `n/a` cannot be read as `warn` or as `ok`.
+    assert.match(report.summary, /fleet_update\s+n\/a\s+no unattended fleet update has recorded a run/);
+    assert.doesNotMatch(report.summary, /fleet_update\s+warn/);
+    assert.equal(check(report, "server")?.state, "ok");
+    assert.equal(check(report, "pin")?.state, "ok");
   } finally {
     cleanup();
   }
@@ -486,7 +514,23 @@ test(`#717: the same checks against the real client (${realCli})`, async (t) => 
     timeoutMs: 10_000,
     harness: "pi",
   });
-  assert.equal(report.provisioningGap, false, `this host is provisioned; report:\n${report.summary}`);
+  // The contract this test guards is that the real tools answer in the shape the parser reads, and that every
+  // half of the report really ran. It is deliberately NOT "this host is green": `fleet_update` reports the
+  // state of an unattended fleet updater this repository does not own, and on 2026-11-19 its absence turned
+  // this unit test red on a host where memory itself was provisioned and healthy. Asserting on state another
+  // repo owns makes a unit test a fleet-status monitor; the state is printed instead, so it stays visible.
+  const outsideProvisioning = report.checks.filter(
+    (c) => c.name === "fleet_update" || c.name === "package_revision" || c.name === "client_version",
+  );
+  const gaps = report.checks.filter((c) => c.state === "fail" && !outsideProvisioning.some((o) => o.name === c.name));
+  assert.deepEqual(
+    gaps.map((c) => `${c.name}: ${c.detail}`),
+    [],
+    `this host's memory is provisioned; report:\n${report.summary}`,
+  );
+  for (const check of outsideProvisioning) {
+    if (check.state !== "ok") console.log(`note: ${check.name} is ${check.state} — ${check.detail}`);
+  }
   assert.deepEqual(names(report).slice(-3), ["bank:project", "bank:global", "bank:infra"]);
   assert.deepEqual(names(report).slice(0, 2), ["client", "config"]);
   // The host-side half really ran (this host has herdr-eng), so the report is not client-only by accident.

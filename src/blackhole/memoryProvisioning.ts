@@ -43,7 +43,7 @@ import { makeRunner } from "./hindsightRunner.ts";
 import { engineeringBank } from "./memoryBanks.ts";
 import { type MemoryPreflightResult, runMemoryPreflight } from "./memoryPreflight.ts";
 
-export type PreflightState = "ok" | "warn" | "fail";
+export type PreflightState = "ok" | "warn" | "unknown" | "fail";
 
 export interface PreflightCheck {
   /** Stable identifier operators quote: `client`, `config`, `credentials:project`, `server`, `bank:project`. */
@@ -109,7 +109,7 @@ export interface PreflightConfig {
   doctor?: (opts: { harness: string; timeoutMs: number }) => Promise<MemoryPreflightResult>;
 }
 
-const ICON: Record<PreflightState, string> = { ok: "ok  ", warn: "warn", fail: "FAIL" };
+const ICON: Record<PreflightState, string> = { ok: "ok  ", warn: "warn", unknown: "n/a ", fail: "FAIL" };
 
 async function call(
   run: HindsightRunner,
@@ -242,7 +242,17 @@ export async function runProvisioningChecks(config: PreflightConfig): Promise<Pr
     );
   } else {
     for (const entry of doctor.checks) {
-      const state: PreflightState = entry.status === "ok" ? "ok" : entry.status === "fail" ? "fail" : "warn";
+      // Doctor's vocabulary is four-valued and `unknown` is not a softer `fail` or a quieter `warn`: it means
+      // the check learned nothing. Folding it into `warn` told operators to reconcile drift that was not there
+      // (#728, measured on a host where `fleet_update` had never been recorded).
+      const state: PreflightState =
+        entry.status === "ok"
+          ? "ok"
+          : entry.status === "fail"
+            ? "fail"
+            : entry.status === "unknown"
+              ? "unknown"
+              : "warn";
       add(entry.name, state, entry.detail || entry.status, beganAt);
     }
   }
@@ -310,4 +320,30 @@ function finish(checks: PreflightCheck[]): PreflightReport {
     inconclusive: checks.length > 0 && !checks.some((c) => c.state === "ok") && !checks.some((c) => c.state === "fail"),
     summary: checks.map((c) => `${c.name}  ${ICON[c.state]}  ${c.detail}  (${c.ms} ms)`).join("\n"),
   };
+}
+
+/**
+ * The checks that produced nothing, split by *why* — because the operator's next action differs.
+ *
+ * `slow` is a call that could not be completed (absent wrapper, timed-out read, unreadable output): wait, or
+ * make the thing reachable. `noData` is a check that completed and answered "I could not tell" (doctor's
+ * `unknown`): there is nothing to reconcile, and calling it drift would send someone to fix a non-problem.
+ */
+export function unansweredChecks(report: PreflightReport): { slow: string[]; noData: string[] } {
+  return {
+    slow: report.checks.filter((c) => c.state === "warn").map((c) => c.name),
+    noData: report.checks.filter((c) => c.state === "unknown").map((c) => c.name),
+  };
+}
+
+/** One trailing sentence naming what did not answer — shared so the notice and `/memory status` cannot disagree. */
+export function unansweredSentence(report: PreflightReport): string {
+  const { slow, noData } = unansweredChecks(report);
+  const parts: string[] = [];
+  if (slow.length > 0) parts.push(`${slow.length} check(s) could not answer: ${slow.join(", ")}`);
+  if (noData.length > 0)
+    parts.push(
+      `${noData.length} check(s) reported no data (the check learned nothing, which is not drift): ${noData.join(", ")}`,
+    );
+  return parts.length > 0 ? ` ${parts.join("; ")}.` : "";
 }

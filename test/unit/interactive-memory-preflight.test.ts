@@ -54,6 +54,10 @@ exit 0
  */
 const DOCTOR_SCRIPT = `#!/bin/sh
 [ "$1" = "memory" ] && [ "$2" = "doctor" ] && [ "$3" = "--json" ] || { echo "unexpected args: $*" >&2; exit 64; }
+if [ "\${FIXTURE_ENG:-healthy}" = "one_unknown" ]; then
+  echo '{"ok":true,"contract":1,"overall":"healthy","checks":[{"name":"credential:project","status":"ok","detail":"0600 file in 0700 parent"},{"name":"fleet_update","status":"unknown","detail":"no unattended fleet update has recorded a run"},{"name":"server","status":"ok","detail":"reachable and credential accepted"}]}'
+  exit 0
+fi
 echo '{"ok":true,"contract":1,"overall":"healthy","checks":[{"name":"credential:project","status":"ok","detail":"0600 file in 0700 parent"},{"name":"server","status":"ok","detail":"reachable and credential accepted"}]}'
 exit 0
 `;
@@ -163,6 +167,36 @@ function withMode<T>(mode: string, fn: () => Promise<T>): Promise<T> {
     else process.env.FIXTURE_MODE = previous;
   });
 }
+
+/** Same lifetime rule for the doctor fixture's own state. */
+function withEngMode<T>(mode: string, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.FIXTURE_ENG;
+  process.env.FIXTURE_ENG = mode;
+  return fn().finally(() => {
+    if (previous === undefined) delete process.env.FIXTURE_ENG;
+    else process.env.FIXTURE_ENG = previous;
+  });
+}
+
+test("#728: /memory status prints a check with no data as no data, not as drift", async () => {
+  resetHindsightBackoff();
+  const f = fixture();
+  try {
+    await withEngMode("one_unknown", () => withMode("healthy", () => f.run("status")));
+    const text = f.notices.map((n) => n.text).join("\n");
+    // The line itself: `n/a`, not `warn`, with doctor's own reason kept.
+    assert.match(text, /fleet_update\s+n\/a\s+no unattended fleet update has recorded a run/, text);
+    assert.doesNotMatch(text, /fleet_update\s+warn/, text);
+    // The verdict: still no gap, and it must not claim every check answered.
+    assert.match(text, /No provisioning gap found/, text);
+    assert.doesNotMatch(text, /Every check answered/, text);
+    // Named as having no data rather than as drift to reconcile, and kept apart from the slow/uncanswered set.
+    assert.match(text, /1 check\(s\) reported no data[^.]*fleet_update/, text);
+    assert.doesNotMatch(text, /could not answer: fleet_update/, text);
+  } finally {
+    f.cleanup();
+  }
+});
 
 test("#717: /memory status prints one preflight line per check", async () => {
   resetHindsightBackoff();
