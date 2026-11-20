@@ -18,7 +18,9 @@ import {
   LOCK_DOMAIN_TOKEN,
   type LockDomainRecord,
   type LockDomainRestampInfo,
+  type PathIdentity,
   classifyLockDomainDrift,
+  classifyPathIdentity,
   lockDomainIntegrityError,
   parseLockDomainRecord,
   restampLockDomainRecord,
@@ -110,6 +112,21 @@ function integrityError(message: string): Error {
   return new Error(`ARTIFACT INTEGRITY: ${message}`);
 }
 
+/**
+ * Refuse a pathname that no longer names the pinned directory (#731).
+ *
+ * The message carries both identities because the absence of them is what made
+ * #731 undiagnosable: the refusal said only "identity changed", so the operator
+ * had to guess which of four assertions fired, and could not tell a substituted
+ * directory from a mount generation from the output.
+ */
+function pinningRefusal(identityMessage: string, expected: PathIdentity, actual: PathIdentity): Error {
+  return lockDomainIntegrityError(
+    `${identityMessage} (inode ${expected.ino} on device ${expected.dev} is not the directory at inode ${actual.ino} on device ${actual.dev}; a substituted directory is not the same store)`,
+    "PATH_PIN_SUBSTITUTED",
+  );
+}
+
 function assertCanonicalSegment(value: string, field: string): void {
   if (
     !CANONICAL_SEGMENT.test(value) ||
@@ -164,7 +181,10 @@ function delay(ms: number): Promise<void> {
  * assertPathPinnedSync so a path that no longer resolves to the descriptor's
  * inode is detected and the store fails closed. The platform-independent
  * invariant is that a swapped directory is never operated on: Linux keeps the
- * operation on the pinned inode, other platforms refuse it. The remaining
+ * operation on the pinned inode, other platforms refuse it. A device-only
+ * difference is NOT a refusal there — `st_dev` is a mount-generation stamp, not
+ * identity (`lockDomain.ts`) — which is what lets a store survive the APFS
+ * volume rollover an OS update leaves behind (#731). The remaining
  * integrity layers (canonical segments, O_NOFOLLOW on every open,
  * trusted-directory assertions, realpath identity checks, exclusive locks,
  * sha256 digests) are platform-independent and stay in force. Reaching the
@@ -188,20 +208,28 @@ async function assertPathPinned(path: string, handle: FileHandle, identityMessag
   if (process.platform === "linux") return; // the kernel pins the descriptor
   const expected = await handle.stat({ bigint: true });
   const actual = await lstat(path, { bigint: true });
-  if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
-    // Same invariant as the descriptor-relative realpath check: the path must
-    // still resolve to the exact inode the descriptor holds.
-    throw integrityError(identityMessage);
-  }
+  const drift = classifyPathIdentity({ dev: expected.dev, ino: expected.ino }, { dev: actual.dev, ino: actual.ino });
+  if (drift.kind === "substituted") throw pinningRefusal(identityMessage, drift.expected, drift.actual);
+  // `mount_generation` is tolerated on purpose. The invariant this assertion
+  // protects is that a swapped-out directory is never operated on, and the inode
+  // is what carries it: a name that still resolves to the pinned inode names the
+  // pinned directory, whatever mount it now resolves through. Requiring device
+  // equality here contradicted `lockDomain.ts` — which states that `st_dev` is a
+  // mount-generation stamp, not identity — and it ran BEFORE `validateLockDomain`
+  // could classify the same difference as a mount generation and re-stamp it, so
+  // every store on a host whose volume generation moved was refused (#731).
+  // Substitution by re-mounting a look-alike directory stays covered: the lock
+  // root must still carry its domain token, be mode 0700 owned by us, and match
+  // the inode the durable record names.
 }
 
 function assertPathPinnedSync(path: string, fd: number, identityMessage: string): void {
   if (process.platform === "linux") return; // the kernel pins the descriptor
   const expected = fstatSync(fd, { bigint: true });
   const actual = lstatSync(path, { bigint: true });
-  if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
-    throw integrityError(identityMessage);
-  }
+  const drift = classifyPathIdentity({ dev: expected.dev, ino: expected.ino }, { dev: actual.dev, ino: actual.ino });
+  if (drift.kind === "substituted") throw pinningRefusal(identityMessage, drift.expected, drift.actual);
+  // Mount-generation drift is tolerated for the reason given on `assertPathPinned`.
 }
 
 /**
@@ -213,14 +241,23 @@ function assertPathPinnedSync(path: string, fd: number, identityMessage: string)
 async function locatePinnedDirectory(handle: FileHandle, ...candidates: string[]): Promise<string> {
   if (process.platform === "linux") return candidates[0]!;
   const expected = await handle.stat({ bigint: true });
+  const want: PathIdentity = { dev: expected.dev, ino: expected.ino };
+  // A candidate on the same device is preferred; a candidate that is the same
+  // inode on another device is the same directory under a new mount generation
+  // and is accepted only when nothing exact matched (#731 — the old equality
+  // test here refused a healthy store after an APFS volume rollover).
+  let drifted: string | undefined;
   for (const candidate of candidates) {
     try {
       const actual = await lstat(candidate, { bigint: true });
-      if (actual.dev === expected.dev && actual.ino === expected.ino) return candidate;
+      const drift = classifyPathIdentity(want, { dev: actual.dev, ino: actual.ino });
+      if (drift.kind === "match") return candidate;
+      if (drift.kind === "mount_generation" && !drifted) drifted = candidate;
     } catch (error) {
       if (!isMissing(error)) throw error;
     }
   }
+  if (drifted) return drifted;
   throw integrityError("pinned artifact directory is no longer reachable by name");
 }
 
@@ -1021,7 +1058,7 @@ export class ArtifactStore {
       if (drift.kind === "unsafe") throw lockDomainIntegrityError(drift.message, drift.code);
       if (!root) {
         throw lockDomainIntegrityError(
-          `artifact lock root identity changed (device ${drift.from} -> ${drift.to} is a mount generation this store cannot re-stamp)`,
+          `artifact lock root identity changed (device ${drift.from} -> ${drift.to} is a mount generation this store cannot re-stamp without its root descriptor; run \`pi-engineering doctor --repair\` for this store)`,
           "LOCK_DOMAIN_RESTAMP_CONFLICT",
         );
       }
@@ -1056,7 +1093,7 @@ export class ArtifactStore {
       candidate = durable;
     }
     throw lockDomainIntegrityError(
-      `artifact lock root identity changed (device ${record.device} -> ${identity.dev} could not be re-stamped while another writer held the lock domain record)`,
+      `artifact lock root identity changed (device ${record.device} -> ${identity.dev} could not be re-stamped while another writer held the lock domain record; run \`pi-engineering doctor --repair\` for this store)`,
       "LOCK_DOMAIN_RESTAMP_CONFLICT",
     );
   }
