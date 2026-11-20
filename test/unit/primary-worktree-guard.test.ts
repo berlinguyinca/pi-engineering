@@ -137,9 +137,13 @@ test("isMutatingGitCommand: blocks commands that change checkout state", () => {
     // Unknown verb at a real command position: fail closed in case git grows a
     // mutating verb this list predates.
     "git what",
-    // A mutating verb inside a quoted argument stays conservative — skipping
-    // quoted spans would let `sh -c 'git commit'` through.
-    'grep -n "git push" README.md',
+    // Text the shell really EXECUTES is code, not a quoted argument: the
+    // quote-awareness of #730 must not open this half.
+    "sh -c 'git commit -m x'",
+    "bash -l -c 'git push origin main'",
+    'eval "git push origin main"',
+    "echo a b | xargs git add",
+    "timeout 30 git push origin main",
   ]) {
     assert.equal(isMutatingGitCommand(command), true, command);
   }
@@ -189,6 +193,12 @@ test("isMutatingGitCommand: allows read-only inspection and worktree management"
     "git worktree list",
     "git worktree prune",
     "gh pr checks 168",
+    // #730: a quoted argument is data. The old rule blocked these because a quoted
+    // span could be `sh -c 'git commit'` — the executed-argument list above is what
+    // covers that case now, by name, instead of blocking documentation about git.
+    'grep -n "git push" README.md',
+    'echo "git push origin main"',
+    "printf '%s' 'git reset --hard'",
   ]) {
     assert.equal(isMutatingGitCommand(command), false, command);
   }
@@ -742,6 +752,70 @@ test("guard: a session whose own worktree was removed is told so", async () => {
     assert.match(blocked?.reason ?? "", /not inside a git worktree/u);
     assert.match(blocked?.reason ?? "", /git worktree remove/u);
     assert.match(blocked?.reason ?? "", /gives you one back/u);
+  } finally {
+    cleanup();
+  }
+});
+
+// ── #730: data is data — heredoc bodies, quoted words, comments ──────────────
+
+/** Verbatim shape from the issue: one prose line reads "...not from a git clone:". */
+const HEREDOC_PROSE =
+  "cat > /tmp/x.md <<'EOF'\n" +
+  "The pin lives in the installed package, and the installed package is built\n" +
+  "from the fleet checkout, not from a git clone:\n" +
+  "EOF";
+
+test("#730: prose inside a heredoc body is not a git invocation", () => {
+  assert.equal(mutatingGitSegment(HEREDOC_PROSE), null);
+  assert.equal(isMutatingGitCommand(HEREDOC_PROSE), false);
+});
+
+test("#730: a git command written as heredoc TEXT is data, not a verb", () => {
+  // The body documents a command; it never runs. `cat` writes /tmp/notes.md and
+  // nothing touches a repository.
+  assert.equal(mutatingGitSegment("cat > /tmp/notes.md <<'EOF'\ngit clone https://example.invalid/r.git\nEOF"), null);
+  // A tabbed body (`<<-`) is data too.
+  assert.equal(mutatingGitSegment("cat > /tmp/notes.md <<-EOF\n\tgit push origin main\n\tEOF"), null);
+});
+
+test("#730: a quoted argument naming a mutating verb is data", () => {
+  for (const command of [
+    'echo "git push origin main"',
+    'printf "%s" "git reset --hard"',
+    'echo "git commit -m x" > /dev/null',
+    "grep -rn 'git push' src/ | head",
+  ]) {
+    assert.equal(mutatingGitSegment(command), null, command);
+  }
+});
+
+test("#730: a comment naming a mutating verb is data", () => {
+  assert.equal(mutatingGitSegment("# git push --force origin main"), null);
+  assert.equal(mutatingGitSegment("echo ok # then git push --force"), null);
+});
+
+test("#730: git in command position still blocks in every shape", () => {
+  for (const command of [
+    "git clone https://example.invalid/r.git /tmp/r",
+    "cat > /tmp/x <<'EOF'\nhi\nEOF\ngit push origin main", // real verb AFTER the heredoc
+    "$(git push origin main)", // command substitution is a command
+    "'git' commit -m x", // quoting does not hide an invocation
+    "echo ok; git push origin main",
+  ]) {
+    assert.equal(isMutatingGitCommand(command), true, command);
+  }
+});
+
+test("#730: the guard lets the documentation command through and refuses the real one", async () => {
+  const { primary, linked, cleanup } = await repoWithSessionBranch();
+  try {
+    const guard = new PrimaryWorktreeGuard(linked);
+    assert.equal(await guard.onToolCall("bash", { command: HEREDOC_PROSE }), undefined);
+    // The same session's real mutation of the primary checkout is still refused.
+    const blocked = await guard.onToolCall("bash", { command: `git -C ${primary} commit -m x` });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /PRIMARY checkout/u);
   } finally {
     cleanup();
   }

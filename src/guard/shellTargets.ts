@@ -471,6 +471,211 @@ export function extractWriteTargets(command: string, env: NodeJS.ProcessEnv = pr
 }
 
 /**
+ * The bytes a shell treats as DATA, removed: heredoc bodies and `#` comments.
+ *
+ * #730 is the report: a session wrote documentation with
+ * `cat > /tmp/x.md <<'EOF' … not from a git clone: … EOF` and the guard read the
+ * prose line as a segment, found `git clone` in it, and refused a command whose
+ * only mutation was a file under `/tmp`. A guard that blocks documentation about
+ * git is a guard people route around, so the scan has to see what the shell
+ * would actually run.
+ *
+ * An UNQUOTED heredoc body (`<<EOF`) still undergoes expansion, so `$(…)` and
+ * backticks inside it really do execute: those substitutions are kept (their
+ * inner text is returned in place of the line) and the surrounding prose is
+ * dropped. A quoted body (`<<'EOF'`, `<<"EOF"`) is pure text and goes entirely.
+ */
+export function stripShellData(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const scanned = scanLine(line);
+    // `code` masks quoted runs (so an operator inside `"…"` is invisible) but it
+    // keeps every index, so the comment offset cuts the ORIGINAL line — masking
+    // the text that is kept would destroy `$VAR` and `~` for the path resolver.
+    const kept = line.slice(0, scanned.commentAt ?? line.length);
+    out.push(kept);
+    for (const heredoc of scanned.heredocs) {
+      for (i += 1; i < lines.length; i++) {
+        const body = lines[i] ?? "";
+        const terminator = heredoc.tabStrip ? body.replace(/^\t+/u, "") : body;
+        if (terminator === heredoc.delimiter) break;
+        if (!heredoc.quoted) {
+          const substitutions = embeddedSubstitutions(body);
+          if (substitutions.length > 0) out.push(substitutions);
+        }
+      }
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * Words a command line would pass to a program, after quote removal — one entry
+ * per WORD, plus what the shell would do with each one.
+ *
+ * The guard used to split on whitespace and strip the quote characters that clung
+ * to the pieces, which turned `echo "git push origin main"` into the words `git`,
+ * `push`, `origin`, `main` and made an argument look like an invocation (#730).
+ * Quote removal is what the shell does; splitting inside a quoted word is not.
+ *
+ * `substituted` marks words lifted out of `$(…)`, `${…(…)}` or backticks: the
+ * shell RUNS that text, so it is a command even where an argument sits. A quoted
+ * word keeps `quoted`/`literal` so a path resolver can still tell `"$WT"` (an
+ * expansion) from `'$WT'` (a directory literally named `$WT`).
+ */
+export interface CommandWord {
+  text: string;
+  /** Any byte came from inside quotes or after a backslash. */
+  quoted: boolean;
+  /** Any byte came from single quotes or a backslash: no expansion happens. */
+  literal: boolean;
+  /** The word is the content of a command substitution — code, not data. */
+  substituted: boolean;
+}
+
+export function commandWords(segment: string, depth = 0): CommandWord[] {
+  const words: CommandWord[] = [];
+  let buffer = "";
+  let quoted = false;
+  let literal = false;
+  let quote: "'" | '"' | undefined;
+  const flush = () => {
+    if (buffer.length === 0 && !quoted && !literal) return;
+    const text = buffer.replace(/^[$('"`!]+/u, "").replace(/['"`),;:]+$/u, "");
+    if (text.length > 0) words.push({ text, quoted, literal, substituted: false });
+    if (depth < MAX_NESTING) {
+      const inner = embeddedSubstitutions(buffer);
+      if (inner.length > 0) {
+        for (const nested of commandWords(inner, depth + 1)) words.push({ ...nested, substituted: true });
+      }
+    }
+    buffer = "";
+    quoted = false;
+    literal = false;
+  };
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i] ?? "";
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      else buffer += ch; // inside quotes: whitespace is word content, not a split
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      quoted = true;
+      literal ||= ch === "'";
+      continue;
+    }
+    if (ch === "\\") {
+      quoted = true;
+      literal = true;
+      const next = segment[i + 1];
+      if (next !== undefined) {
+        buffer += next;
+        i++;
+      }
+      continue;
+    }
+    if (/\s/u.test(ch)) flush();
+    else buffer += ch;
+  }
+  flush();
+  return words;
+}
+
+/** The words themselves, which is all a verb scan needs. */
+export function shellWords(text: string): string[] {
+  return commandWords(text).map((word) => word.text);
+}
+
+/** What one line of a command line opens: a comment, and any heredocs. */
+interface LineScan {
+  /** Where an unquoted `#` starts a comment, if one does. */
+  commentAt: number | undefined;
+  /** Heredocs the line opens, in order. */
+  heredocs: { delimiter: string; quoted: boolean; tabStrip: boolean }[];
+}
+
+/**
+ * Walk a line the way the shell reads it, so only operators OUTSIDE quotes are
+ * seen. A regex over the raw line reads `cat > "a << b"` as a heredoc, and a
+ * regex over a quote-masked line cannot see `<<'EOF'` at all — the delimiter is
+ * inside the masked run. So the scan is done once, character by character.
+ */
+function scanLine(line: string): LineScan {
+  let commentAt: number | undefined;
+  const heredocs: LineScan["heredocs"] = [];
+  let quote: "'" | '"' | undefined;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i] ?? "";
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /\s/u.test(line[i - 1] ?? ""))) {
+      commentAt = i;
+      break;
+    }
+    // `<<DELIM`, `<<-DELIM`, `2<<DELIM` open a body; `<<<word` is a herestring.
+    if (ch !== "<" || line[i + 1] !== "<" || line[i + 2] === "<") continue;
+    let j = i + 2;
+    const tabStrip = line[j] === "-";
+    if (tabStrip) j++;
+    while (line[j] === " " || line[j] === "\t") j++;
+    const quoteChar = line[j];
+    const quoted = quoteChar === "'" || quoteChar === '"';
+    if (quoted) j++;
+    let delimiter = "";
+    while (/[A-Za-z0-9_]/u.test(line[j] ?? " ")) {
+      delimiter += line[j];
+      j++;
+    }
+    if (delimiter.length === 0) continue;
+    if (quoted && line[j] === quoteChar) j++;
+    heredocs.push({ delimiter, quoted, tabStrip });
+    i = j - 1; // the body starts on the next line
+  }
+  return { commentAt, heredocs };
+}
+
+/** The text inside `$(…)`, `${…(…)}` and backticks — code the shell executes. */
+function embeddedSubstitutions(text: string): string {
+  const parts: string[] = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const two = text.slice(i, i + 2);
+    if (two === "$(" || two === "${") {
+      const open = i + 1;
+      const close = matchBracket(text, open);
+      const closed = close < text.length;
+      const inner = text.slice(open + 1, closed ? close : text.length);
+      if (two === "$(")
+        parts.push(inner); // executes as written
+      else {
+        // `${FOO:-$(git rev-parse HEAD)}` runs the substitution inside it.
+        const nested = embeddedSubstitutions(inner);
+        if (nested.length > 0) parts.push(nested);
+      }
+      if (closed) i = close;
+      continue;
+    }
+    if (text[i] === "`") {
+      const end = text.indexOf("`", i + 1);
+      if (end > i) {
+        parts.push(text.slice(i + 1, end));
+        i = end;
+      }
+    }
+  }
+  return parts.join(" ");
+}
+
+/**
  * Expand `$NAME` and a leading `~` in a word the shell would expand. Returns
  * undefined when the word names a variable this process cannot resolve, or
  * carries a command substitution — the caller must then treat the path as
