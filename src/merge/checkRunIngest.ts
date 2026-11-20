@@ -50,10 +50,31 @@ export interface RestCheckRun {
 /** Baseline slice used for classification (same shape mergeGate accepts). */
 export type CheckFailureBaseline = Pick<FailureBaseline, "baseSha" | "failures" | "flaky">;
 
+/**
+ * A commit status from the GitHub REST API
+ * (`/repos/{owner}/{repo}/commits/{ref}/statuses`). This is the shape Woodpecker
+ * (#722) and every other status-publishing CI reports through — a check run and a
+ * commit status are different API surfaces, and reading only the first makes a
+ * status-publishing CI invisible to the gate.
+ */
+export interface RestCommitStatus {
+  /** The status context, e.g. `ci/woodpecker/pr/ci`. */
+  context: string;
+  /** `"pending"`, `"success"`, `"failure"` or `"error"`. */
+  state: string;
+  sha?: string;
+  description?: string;
+  target_url?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface NormalizeCheckRunsInput {
   headSha: string;
   ghChecks?: readonly GhPrCheck[];
   restCheckRuns?: readonly RestCheckRun[];
+  /** Commit statuses (#722); ingested last, so a same-named status wins a tie. */
+  restStatuses?: readonly RestCommitStatus[];
 }
 
 /** Map a gh check bucket (lower-cased) to a CheckRun status. */
@@ -96,6 +117,21 @@ function restStatus(status: string | undefined, conclusion: string | null | unde
   }
 }
 
+/** Map a commit status state to a CheckRun status. Anything unknown fails closed. */
+function commitStatusState(state: string | undefined): CheckRun["status"] {
+  switch (state?.toLowerCase()) {
+    case "success":
+      return "pass";
+    case "pending":
+      return "pending";
+    case "failure":
+    case "error":
+      return "fail";
+    default:
+      return "fail";
+  }
+}
+
 /** Treat empty and the zero-time `0001-…` dates as "no date" (empty string). */
 function normalizeDate(value: string | null | undefined): string {
   if (!value) return "";
@@ -122,9 +158,9 @@ function dateKey(completedAt: string | null | undefined, startedAt: string | nul
  * non-string name are dropped. Entries are de-duplicated by name keeping the
  * entry with the latest `(completedAt ?? startedAt)` date (empty or
  * `0001-`-prefixed dates count as absent but do not fall back to `startedAt`);
- * ties keep the later input, with REST entries considered after gh entries.
- * The result is sorted by name via `localeCompare` and the input is never
- * mutated.
+ * ties keep the later input, with REST entries considered after gh entries and
+ * commit statuses after both. The result is sorted by name via `localeCompare`
+ * and the input is never mutated.
  */
 export function normalizeCheckRuns(input: NormalizeCheckRunsInput): CheckRun[] {
   const byName = new Map<string, CheckRun>();
@@ -160,6 +196,19 @@ export function normalizeCheckRuns(input: NormalizeCheckRunsInput): CheckRun[] {
       rest.name,
       { name: rest.name, status: restStatus(rest.status, rest.conclusion), sha },
       dateKey(rest.completed_at, rest.started_at),
+    );
+  }
+
+  // Statuses last: GitHub returns the whole history for a context, and the newest
+  // entry is the current truth — a superseded run's `error` must not outrank the
+  // rerun that passed (#722). `updated_at` falls back to `created_at`.
+  for (const st of input.restStatuses ?? []) {
+    if (typeof st.context !== "string" || st.context === "") continue;
+    const sha = typeof st.sha === "string" && st.sha !== "" ? st.sha : input.headSha;
+    upsert(
+      st.context,
+      { name: st.context, status: commitStatusState(st.state), sha },
+      dateKey(st.updated_at ?? st.created_at, st.created_at),
     );
   }
 

@@ -14,7 +14,7 @@
  */
 import { execFile } from "node:child_process";
 import { isAbsolute } from "node:path";
-import { normalizeCheckRuns } from "../merge/checkRunIngest.ts";
+import { type RestCommitStatus, normalizeCheckRuns } from "../merge/checkRunIngest.ts";
 import { decideMerge } from "../merge/mergeGate.ts";
 import type { CheckRun, MergeDecision } from "../merge/mergeGate.ts";
 import { type LineageEmitter, lineageNodeId } from "../runtime/herdr/lineage.ts";
@@ -268,10 +268,16 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
     const scope = { mission_id: link.missionId };
     let runs: CheckRun[] = [];
     // No answer from the checks API (absent, failing or malformed) is "no CI evidence", never "no checks needed".
+    // The statuses surface counts as checks: Woodpecker (#722) publishes there and nowhere else, so a head whose
+    // only check run is some unrelated scanner is not evidence that CI ran.
     let checksUnavailable = !client.listCheckRuns;
     if (client.listCheckRuns) {
       try {
-        runs = normalizeCheckRuns({ headSha: head, restCheckRuns: await client.listCheckRuns(ref, head) });
+        const [restCheckRuns, restStatuses] = await Promise.all([
+          client.listCheckRuns(ref, head),
+          client.listCommitStatuses ? client.listCommitStatuses(ref, head) : Promise.resolve([] as RestCommitStatus[]),
+        ]);
+        runs = normalizeCheckRuns({ headSha: head, restCheckRuns, restStatuses });
       } catch {
         runs = [];
         checksUnavailable = true;
@@ -298,7 +304,9 @@ export async function githubSync(deps: GithubSyncDeps): Promise<GithubSyncReport
       candidateSha: candidate,
       prHeadSha: head,
       baseSha: "",
-      checks: onHead,
+      // Every row, not only the ones matching the head: a check or status reported for a
+      // different commit is a mismatch the gate must reject, not evidence to drop (#722).
+      checks: runs,
       requiredChecks: required ?? onHead.map((r) => r.name),
       review,
       queue: [],

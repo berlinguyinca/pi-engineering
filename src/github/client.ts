@@ -14,7 +14,7 @@
  *  - Timeout, stdout cap, `GH_PROMPT_DISABLED`, no pager, no update check.
  */
 import { execFile } from "node:child_process";
-import type { RestCheckRun } from "../merge/checkRunIngest.ts";
+import type { RestCheckRun, RestCommitStatus } from "../merge/checkRunIngest.ts";
 import { type GithubRef, type RefConfig, type RepoKey, normaliseRepo, parseGithubRef, refKey } from "./refs.ts";
 import { boundBody, boundTitle, parseableBody } from "./sanitize.ts";
 
@@ -84,6 +84,12 @@ export interface GithubClient {
   /** Native issue dependency / sub-issue relations; absent when the server cannot answer. */
   listDependencies?(ref: GithubRef): Promise<GhDependencies>;
   listCheckRuns?(ref: GithubRef, sha: string): Promise<RestCheckRun[]>;
+  /**
+   * Commit statuses for a head sha. Woodpecker (#722) and every other
+   * status-publishing CI reports here, not through `check-runs`, so a gate that
+   * reads only check runs cannot see it.
+   */
+  listCommitStatuses?(ref: GithubRef, sha: string): Promise<RestCommitStatus[]>;
   /** T13: an OPEN pull request from `branch` of the same repository, or null. */
   findOpenPullRequestByHead?(repo: RepoKey, branch: string): Promise<GhPullRequest | null>;
   /** T13: open a pull request (draft by default at the caller). Never merges, never closes. */
@@ -416,6 +422,36 @@ export class GhCliClient implements GithubClient {
         status: str(r.status),
         conclusion: typeof r.conclusion === "string" ? r.conclusion : null,
         html_url: str(r.html_url).slice(0, 500),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Commit statuses for `sha` (#722). GitHub returns the whole history for each
+   * context — a superseded run's `error` and the rerun that passed can both be in
+   * the list — so every row is returned and `normalizeCheckRuns` picks the newest
+   * by `updated_at`/`created_at`.
+   */
+  async listCommitStatuses(ref: GithubRef, sha: string): Promise<RestCommitStatus[]> {
+    if (!/^[0-9a-f]{7,64}$/i.test(sha)) throw new GithubClientError("invalid", "bad sha");
+    const { repo } = this.numberPath(ref, "issues/{n}");
+    const items = await this.apiPages(
+      repo.host,
+      `repos/${repo.owner}/${repo.repo}/commits/${sha.toLowerCase()}/statuses`,
+    );
+    const out: RestCommitStatus[] = [];
+    for (const item of items) {
+      const r = asRecord(item);
+      if (typeof r.context !== "string" || r.context === "") continue;
+      out.push({
+        context: boundTitle(r.context),
+        state: str(r.state),
+        sha: str(r.sha),
+        description: str(r.description).slice(0, 500),
+        target_url: str(r.target_url).slice(0, 500),
+        created_at: str(r.created_at),
+        updated_at: str(r.updated_at),
       });
     }
     return out;

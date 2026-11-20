@@ -5,7 +5,7 @@ import { linkPullRequest } from "../../src/github/prLinks.ts";
 import type { QuorumView } from "../../src/github/quorum.ts";
 import { type GithubRef, parseGithubRef } from "../../src/github/refs.ts";
 import { githubSync } from "../../src/github/sync.ts";
-import type { RestCheckRun } from "../../src/merge/checkRunIngest.ts";
+import type { RestCheckRun, RestCommitStatus } from "../../src/merge/checkRunIngest.ts";
 import { MissionStore } from "../../src/orchestration/missionStore.ts";
 import { JsonlEventStore } from "../../src/platform/eventstore/jsonl.ts";
 import { FakeGithubClient } from "../support/fakeGithubClient.ts";
@@ -24,8 +24,12 @@ const ref = (t: string): GithubRef => {
 
 class ChecksClient extends FakeGithubClient {
   runs: RestCheckRun[] = [];
+  statuses: RestCommitStatus[] = [];
   async listCheckRuns(_ref: GithubRef, sha: string): Promise<RestCheckRun[]> {
     return this.runs.map((r) => ({ ...r, head_sha: r.head_sha ?? sha }));
+  }
+  async listCommitStatuses(_ref: GithubRef, sha: string): Promise<RestCommitStatus[]> {
+    return this.statuses.map((s) => ({ ...s, sha: s.sha || sha }));
   }
 }
 
@@ -408,5 +412,71 @@ describe("githubSync: the re-review dispatch", () => {
     };
     await Promise.all([tick({ run: slow }), tick({ run: slow })]);
     assert.equal(runs, 1);
+  });
+});
+
+// --- #722: Woodpecker's result arrives as a commit STATUS, never a check run ----
+//
+// Before this, `sync` read only `/commits/{sha}/check-runs`, so a head whose only
+// check run was GitGuardian looked like CI evidence while the pipeline had never
+// started, and a pipeline still running looked like nothing at all.
+
+describe("githubSync: commit statuses are CI evidence (#722)", () => {
+  const sat = { quorum: quorum({ status: "satisfied" }) };
+  const deps = (w: Awaited<ReturnType<typeof world>>) => ({
+    client: w.client,
+    store: w.store,
+    cfg,
+    lineage: w.rec as never,
+    now: NOW,
+    ...sat,
+  });
+
+  it("a pending status holds the gate even when every check run is green", async () => {
+    const w = await world();
+    w.client.runs = green;
+    w.client.statuses = [{ context: "ci/woodpecker/pr/ci", state: "pending" }];
+    const r = await githubSync(deps(w));
+    assert.equal(r.gates[0]?.decision, "wait");
+    assert.ok(
+      r.gates[0]?.reasons.some((x) => x.includes("ci/woodpecker/pr/ci") && x.includes("pending")),
+      `reasons: ${r.gates[0]?.reasons.join(" | ")}`,
+    );
+    assert.equal(gateEdgeOps(w.rec).length, 0, "a pending pipeline validates nothing");
+  });
+
+  it("a green status is enough evidence to merge, and is projected as the CI node", async () => {
+    const w = await world();
+    w.client.runs = []; // GitGuardian never ran either: the status is the whole record
+    w.client.statuses = [{ context: "ci/woodpecker/pr/ci", state: "success" }];
+    const r = await githubSync(deps(w));
+    assert.equal(r.gates[0]?.decision, "merge");
+    const ciNodes = w.rec.calls.filter(
+      (c) =>
+        c.op === "nodeUpsert" &&
+        String(c.args[0]).startsWith("gate:") &&
+        (c.args[1] as { state?: string }).state === "done",
+    );
+    assert.equal(ciNodes.length, 1, "the status is the CI node that got projected");
+  });
+
+  it("a statuses API that cannot be answered is no CI evidence", async () => {
+    const w = await world();
+    w.client.runs = green;
+    w.client.listCommitStatuses = async () => {
+      throw new Error("statuses API down");
+    };
+    const r = await githubSync(deps(w));
+    assert.equal(r.gates[0]?.decision, "wait");
+    assert.match(r.gates[0]?.reasons[0] ?? "", /no CI evidence/);
+  });
+
+  it("a status reported for a different commit does not clear this head", async () => {
+    const w = await world();
+    w.client.runs = green;
+    w.client.statuses = [{ context: "ci/woodpecker/pr/ci", state: "success", sha: SHA2 }];
+    const r = await githubSync(deps(w));
+    assert.equal(r.gates[0]?.decision, "reject", "a check for another sha is a mismatch, not a pass");
+    assert.ok(r.gates[0]?.reasons.some((x) => x.includes("sha") && x.includes("ci/woodpecker/pr/ci")));
   });
 });

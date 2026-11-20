@@ -3,6 +3,7 @@ import { test } from "node:test";
 import {
   type GhPrCheck,
   type RestCheckRun,
+  type RestCommitStatus,
   classifyCheckFailures,
   normalizeCheckRuns,
 } from "../../src/merge/checkRunIngest.ts";
@@ -289,4 +290,109 @@ test("PARITY: classifyCheckFailures matches decideMerge.failureClasses", () => {
 
   assert.deepEqual(fromClassifier, decision.failureClasses);
   assert.deepEqual(fromClassifier, { ci: "base", lint: "flaky" });
+});
+
+// --- #722: Woodpecker publishes commit STATUSES, and nothing read them ----------
+//
+// `GET /commits/{sha}/check-runs` lists GitGuardian and nothing else; the
+// pipeline result arrives as a commit STATUS named `ci/woodpecker/pr/ci`. Ingesting
+// only check runs meant a head with one green GitGuardian run looked like CI evidence
+// while the pipeline had never run.
+
+/** Builder for a REST commit-status entry. */
+function status(context: string, state: string, over: Partial<RestCommitStatus> = {}): RestCommitStatus {
+  return { context, state, ...over };
+}
+
+const asPairs = (runs: readonly CheckRun[]) => runs.map((r) => [r.name, r.status, r.sha]);
+
+test("#722: a commit status becomes a CheckRun named by its context", () => {
+  const runs = normalizeCheckRuns({
+    headSha: HEAD,
+    restStatuses: [
+      status("ci/woodpecker/pr/ci", "success", { sha: HEAD, target_url: "https://ci/pipeline/341/1" }),
+      status("ci/pending", "pending"),
+      status("ci/fails", "failure"),
+      status("ci/errors", "error"),
+      status("ci/mystery", "waiting_for_review"),
+    ],
+  });
+  // An unknown state is a failure, not a pass: the gate fails closed.
+  assert.deepEqual(asPairs(runs), [
+    ["ci/errors", "fail", HEAD],
+    ["ci/fails", "fail", HEAD],
+    ["ci/mystery", "fail", HEAD],
+    ["ci/pending", "pending", HEAD],
+    ["ci/woodpecker/pr/ci", "pass", HEAD],
+  ]);
+});
+
+test("#722: the newest status wins, so a superseded run's error cannot mask a later pass", () => {
+  const older = status("ci/woodpecker/pr/ci", "failure", {
+    description: "Pipeline failed",
+    updated_at: "2026-11-20T01:00:00Z",
+  });
+  const newer = status("ci/woodpecker/pr/ci", "success", {
+    description: "Pipeline was successful",
+    updated_at: "2026-11-20T02:00:00Z",
+  });
+  for (const restStatuses of [
+    [older, newer],
+    [newer, older],
+  ]) {
+    const runs = normalizeCheckRuns({ headSha: HEAD, restStatuses });
+    assert.equal(runs.length, 1, "one entry per context");
+    assert.equal(runs[0]?.status, "pass", "the later updated_at wins whichever order the API returns");
+  }
+});
+
+test("#722: created_at is the date when a status carries no updated_at", () => {
+  const runs = normalizeCheckRuns({
+    headSha: HEAD,
+    restStatuses: [
+      status("ci", "success", { updated_at: "2026-11-20T05:00:00Z", created_at: "2026-11-20T04:00:00Z" }),
+      status("ci", "failure", { created_at: "2026-11-20T06:00:00Z" }),
+    ],
+  });
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.status, "fail", "the undated-in-updated_at entry is still dated by created_at");
+});
+
+test("#722: statuses merge with check runs by name, and a status for another commit keeps that sha", () => {
+  const runs = normalizeCheckRuns({
+    headSha: HEAD,
+    restCheckRuns: [rest("ci", { status: "completed", conclusion: "failure", completed_at: "2026-11-20T01:00:00Z" })],
+    restStatuses: [status("ci", "success", { updated_at: "2026-11-20T02:00:00Z" })],
+  });
+  assert.deepEqual(asPairs(runs), [["ci", "pass", HEAD]]);
+
+  const stale = normalizeCheckRuns({ headSha: HEAD, restStatuses: [status("ci", "success", { sha: "deadbeef" })] });
+  assert.deepEqual(asPairs(stale), [["ci", "pass", "deadbeef"]], "the gate rejects a check for another commit");
+
+  const unnamed = normalizeCheckRuns({ headSha: HEAD, restStatuses: [{ state: "success" } as RestCommitStatus] });
+  assert.deepEqual(unnamed, [], "an entry with no context is dropped");
+});
+
+test("#722: decideMerge waits while an ingested status is still pending", () => {
+  const checks = normalizeCheckRuns({
+    headSha: HEAD,
+    restCheckRuns: [rest("GitGuardian Security Checks")],
+    restStatuses: [status("ci/woodpecker/pr/ci", "pending")],
+  });
+  const decision = decideMerge({
+    repo: "r",
+    prNumber: 1,
+    candidateSha: HEAD,
+    prHeadSha: HEAD,
+    baseSha: BASE,
+    checks,
+    requiredChecks: ["GitGuardian Security Checks", "ci/woodpecker/pr/ci"],
+    review: { verdict: "PASS", sha: HEAD },
+    queue: [],
+  });
+  assert.equal(decision.decision, "wait");
+  assert.ok(
+    decision.reasons.some((r) => r.includes("ci/woodpecker/pr/ci") && r.includes("pending")),
+    `reasons: ${decision.reasons.join(" | ")}`,
+  );
 });
