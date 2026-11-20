@@ -45,7 +45,15 @@
 import { realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { safeGit } from "../git/safeGit.ts";
-import { resolveDirectoryWord, resolveWriteTarget, extractWriteTargets as shellWriteTargets } from "./shellTargets.ts";
+import {
+  type CommandWord,
+  commandWords,
+  resolveDirectoryWord,
+  resolveWriteTarget,
+  shellWords,
+  extractWriteTargets as shellWriteTargets,
+  stripShellData,
+} from "./shellTargets.ts";
 
 export interface PrimaryWorktreeGuardConfig {
   enabled: boolean;
@@ -81,10 +89,15 @@ export function resolvePrimaryWorktreeGuardConfig(env: NodeJS.ProcessEnv = proce
   };
 }
 
-/** Split a shell command into segments at the usual separators. */
+/**
+ * Split a shell command into segments at the usual separators, after dropping
+ * what the shell treats as data (#730): a heredoc body and a `#` comment are not
+ * commands, and splitting them into "segments" made prose about `git clone` read
+ * like one.
+ */
 export function segments(command: string): string[] {
-  return command
-    .split(/&&|\|\||[;|\n]/)
+  return stripShellData(command)
+    .split(/&&|\|\||[;|\n]/u)
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -107,16 +120,16 @@ export function extractWriteTargets(command: string, env: NodeJS.ProcessEnv = pr
 const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--git-common-dir"]);
 
 /**
- * Split a segment into words and drop the shell punctuation that clings to
- * them (`'git`, `$(git`, `commit"`), so quoting does not hide an invocation
- * and a quoted verb still reads as a verb.
+ * Split a segment into words the way the shell does: quote removal, one word per
+ * quoted run, and the punctuation clinging to an unclosed substitution (`'git`,
+ * `$(git`, `commit"`) dropped, so quoting does not hide an invocation.
+ *
+ * Splitting inside a quoted run is what made `echo "git push origin main"` look
+ * like an invocation of `git push` (#730): the shell hands `echo` ONE word whose
+ * content happens to name a verb.
  */
 export function tokenize(segment: string): string[] {
-  return segment
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((token) => token.replace(/^[$('"`!]+/, "").replace(/['"`),;:]+$/, ""))
-    .filter(Boolean);
+  return shellWords(segment);
 }
 
 /**
@@ -140,14 +153,69 @@ function isGitCommand(word: string): boolean {
 /** Words that may precede a command name without being the command itself. */
 const COMMAND_PREFIXES = new Set(["sudo", "env", "command", "time", "do", "then", "else", "!", "(", "{"]);
 
+/**
+ * Verbs whose argument is a command that really executes: `sh -c '…'`, `eval "…"`,
+ * `xargs git …`, `timeout 10 git …`. Their following words are code, so a git verb
+ * inside them sits in command position like any other invocation — this is what
+ * keeps #730's quote-awareness from becoming a hole.
+ */
+const EXEC_ARGUMENT_VERBS = new Set([
+  "bash",
+  "sh",
+  "zsh",
+  "dash",
+  "ksh",
+  "fish",
+  "eval",
+  "xargs",
+  "parallel",
+  "nohup",
+  "nice",
+  "timeout",
+  "stdbuf",
+  "setsid",
+  "watch",
+]);
+
 /** True when `tokens[i]` is where a command name may sit (after `FOO=bar sudo …`). */
 export function atCommandPosition(tokens: string[], i: number): boolean {
   for (let j = i - 1; j >= 0; j--) {
     const prev = tokens[j];
-    if (prev === undefined || COMMAND_PREFIXES.has(prev) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev)) continue;
+    if (prev === undefined || COMMAND_PREFIXES.has(prev) || /^[A-Za-z_][A-Za-z0-9_]*=/u.test(prev)) continue;
     return false;
   }
   return true;
+}
+
+/** A word plus the one question the guard asks about it: would the shell run it? */
+interface CodeWord {
+  word: CommandWord;
+  commandPosition: boolean;
+}
+
+/**
+ * The words of a segment and whether each is CODE. A word lifted out of `$(…)` is;
+ * so is anything after `sh -c` / `eval` / `xargs`, re-split into words because the
+ * shell re-splits it. A quoted word that is a plain argument is not.
+ */
+function codeWords(segment: string): CodeWord[] {
+  const words = commandWords(segment);
+  const texts = words.map((word) => word.text);
+  const out: CodeWord[] = [];
+  let executing = false;
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!;
+    if (executing) {
+      for (const inner of commandWords(word.text)) {
+        out.push({ word: { ...inner, substituted: true }, commandPosition: true });
+      }
+      continue;
+    }
+    const commandPosition = word.substituted || atCommandPosition(texts, i);
+    out.push({ word, commandPosition });
+    if (commandPosition && EXEC_ARGUMENT_VERBS.has(word.text)) executing = true;
+  }
+  return out;
 }
 
 interface GitInvocation {
@@ -157,19 +225,19 @@ interface GitInvocation {
 }
 
 function gitInvocations(segment: string): GitInvocation[] {
-  const tokens = tokenize(segment);
+  const codes = codeWords(segment);
   const invocations: GitInvocation[] = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const word = tokens[i];
-    if (word === undefined || !isGitCommand(word)) continue;
+  for (let i = 0; i < codes.length; i++) {
+    const entry = codes[i]!;
+    if (!isGitCommand(entry.word.text)) continue;
     let j = i + 1;
-    while (j < tokens.length) {
-      const flag = tokens[j];
+    while (j < codes.length) {
+      const flag = codes[j]!.word.text;
       if (flag === undefined || !flag.startsWith("-")) break;
       j += GIT_FLAGS_WITH_ARG.has(flag) ? 2 : 1;
     }
-    const verb = tokens[j];
-    if (verb !== undefined) invocations.push({ verb, invoked: atCommandPosition(tokens, i) });
+    const verb = codes[j]?.word.text;
+    if (verb !== undefined) invocations.push({ verb, invoked: entry.commandPosition });
   }
   return invocations;
 }
@@ -336,6 +404,11 @@ function offenders(command: string): MutatingGitSegment[] {
 function segmentOffenders(segment: string): MutatingGitSegment[] {
   const out: MutatingGitSegment[] = [];
   for (const { verb, invoked } of gitInvocations(segment)) {
+    // A verb that sits inside an argument is text about a command, not one. The
+    // first version applied this only to verbs git does not know, so
+    // `echo "git push origin main"` and a heredoc line reading
+    // "…not from a git clone:" were refused (#730).
+    if (!invoked) continue;
     if (verb === "worktree") continue; // escape hatch: add/remove/list/prune
     if (READ_ONLY_VERBS.has(verb)) {
       // A read-only verb can still write through its subcommand (`branch -D`,
@@ -345,7 +418,7 @@ function segmentOffenders(segment: string): MutatingGitSegment[] {
     }
     if (MUTATING_VERBS.has(verb)) out.push({ verb, segment });
     // `git <verb git does not know>`: fail closed
-    else if (invoked) out.push({ verb, segment });
+    else out.push({ verb, segment });
   }
   return out;
 }
