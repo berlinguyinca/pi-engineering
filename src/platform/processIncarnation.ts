@@ -11,7 +11,16 @@
  * - **Darwin** has no procfs. The equivalent is `kern.boottime`'s epoch seconds
  *   (hashed into a UUID so the durable record's shape stays platform
  *   independent) plus `ps -o lstart=` parsed under `LC_ALL=C`, giving absolute
- *   epoch seconds — stable for the life of the process.
+ *   epoch seconds — stable for the life of the process, and read from the year
+ *   ps prints (see {@link parseDarwinLstart}), because the year a process began
+ *   in is not something the probing clock gets to decide.
+ *
+ * One resolution limit, on Darwin only: `lstart` reports whole seconds, so a pid
+ * reused within the same second as its predecessor is indistinguishable there,
+ * while Linux `starttime` ticks (~10 ms) usually tell them apart. It is inherent
+ * to `ps`, the only start-time source Node can reach without a native helper, so
+ * it is stated rather than fixed — and it does not weaken the year rule, whose
+ * only added ambiguity is a full year, which the boot id covers.
  *
  * `src/platform/eventstore/fileLock.ts` and `src/runtime/isolation/processIdentity.ts`
  * both need this, and used to carry separate copies. The runtime copy was
@@ -44,10 +53,93 @@ const DARWIN_MONTH = {
   Nov: 10,
   Dec: 11,
 } as const;
-// C-locale `ps -o lstart=`: "Dow Mon DD HH:MM:SS" with the year omitted for
-// the current year (macOS ps prints the year only for other years).
+// C-locale `ps -o lstart=`: "Dow Mon DD HH:MM:SS YYYY". macOS ps prints the year
+// for every process (verified on this host: `ps -o lstart= -p 1` ->
+// "Fri Nov 20 13:03:30 2026"); BSD ps omits it for current-year processes, which
+// is the only case `probeYear` below exists to cover.
 const DARWIN_LSTART =
   /^\s*(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})(?:\s+(\d{4}))?\s*$/;
+
+/**
+ * Local epoch seconds for a `ps -o lstart=` rendering, or `undefined` when the
+ * text is not one. Fields are range-checked rather than left for `Date` to
+ * normalise, so a truncated or corrupt probe yields "no answer" instead of a
+ * plausible wrong instant.
+ *
+ * `probeYear` is used only when ps printed no year. Where a year is printed it
+ * is a fact about the process and wins: deriving it from the clock instead made
+ * one process yield a different incarnation after 1 January, which both callers
+ * read as PID reuse and acted on by reclaiming a live owner's lease.
+ */
+export function parseDarwinLstart(output: string, probeYear: number): number | undefined {
+  const match = DARWIN_LSTART.exec(output);
+  if (!match) return undefined;
+  const month = (DARWIN_MONTH as Partial<Record<string, number>>)[match[1] ?? ""];
+  const day = Number(match[2]);
+  const hours = Number(match[3]);
+  const minutes = Number(match[4]);
+  const seconds = Number(match[5]);
+  const year = match[6] === undefined ? probeYear : Number(match[6]);
+  if (
+    month === undefined ||
+    day < 1 ||
+    day > 31 ||
+    hours > 23 ||
+    minutes > 59 ||
+    seconds > 59 ||
+    !Number.isSafeInteger(year) ||
+    year < 1000
+  ) {
+    return undefined;
+  }
+  const start = new Date(year, month, day, hours, minutes, seconds);
+  const epoch = Math.floor(start.getTime() / 1000);
+  return Number.isFinite(epoch) && epoch > 0 ? epoch : undefined;
+}
+
+function epochSecondsOf(value: string): number | undefined {
+  return /^\d+$/.test(value) && Number(value) > 0 ? Number(value) : undefined;
+}
+
+export type StartTimeComparison = "exact" | "year_ambiguous" | "different";
+
+/**
+ * Compare two Darwin incarnation values.
+ *
+ * `exact` is the normal answer. `year_ambiguous` means same month, day and clock
+ * time in different years — the only shape a value written before the printed-year
+ * fix can take against a probe after it, so it must never be read as PID reuse.
+ * Year discrimination is not lost with it: both call sites check the boot id
+ * first, and a pid reused at the identical second of a different year on a
+ * machine that never rebooted is a coincidence the boot id already covers.
+ */
+export function compareDarwinStartTimes(stored: string, probed: string): StartTimeComparison {
+  if (stored === probed) return "exact";
+  const a = epochSecondsOf(stored);
+  const b = epochSecondsOf(probed);
+  if (a === undefined || b === undefined) return "different";
+  const left = new Date(a * 1000);
+  const right = new Date(b * 1000);
+  const sameWallClock =
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate() &&
+    left.getHours() === right.getHours() &&
+    left.getMinutes() === right.getMinutes() &&
+    left.getSeconds() === right.getSeconds();
+  return sameWallClock && left.getFullYear() !== right.getFullYear() ? "year_ambiguous" : "different";
+}
+
+/**
+ * Do these two recorded/probed start times describe the same process?
+ *
+ * Identity on Linux is exact (field 22 is ticks since boot, so a year means
+ * nothing there) and on Darwin it is exact plus the year ambiguity above.
+ * `platform` is a parameter so the Darwin rule is testable off macOS.
+ */
+export function startTimesMatch(stored: string, probed: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (stored === probed) return true;
+  return platform === "darwin" && compareDarwinStartTimes(stored, probed) === "year_ambiguous";
+}
 
 function darwinBootTimeSeconds(): number | undefined {
   try {
@@ -60,7 +152,8 @@ function darwinBootTimeSeconds(): number | undefined {
 }
 
 /**
- * Kernel boot id, or `null` where the platform exposes none. Changes on every
+ * Kernel boot id, or `null` where the platform exposes none. (Bounded by design:
+ * one probe per process lifetime.) Changes on every
  * reboot, so a record whose boot id differs describes a process that cannot
  * exist any more.
  */
@@ -123,23 +216,8 @@ function probeProcessStartTime(pid: number): ProcessStartTime {
       // and must fail closed as "unknown" (neither live nor stale).
       return (error as { status?: number }).status === 1 ? { state: "missing" } : { state: "unknown" };
     }
-    const match = DARWIN_LSTART.exec(output);
-    if (!match) return { state: "unknown" };
-    const month = DARWIN_MONTH[match[1] as keyof typeof DARWIN_MONTH];
-    // The year `ps` prints (group 6) is deliberately ignored. The implementation
-    // this was consolidated from read `match[7]`, which never exists, so every
-    // durable value in the wild was computed with the *current* year. Honouring
-    // the printed year would change the epoch for a process started in an earlier
-    // year, and a lock record written before that change would then mismatch its
-    // still-live owner and be reclaimed as stale. The error is symmetric — record
-    // and probe use the same year — so liveness stays correct; the group index is
-    // reported separately rather than fixed inside a de-duplication.
-    const year = new Date().getFullYear();
-    const start = new Date(year, month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5]));
-    const seconds = Math.floor(start.getTime() / 1000);
-    return Number.isFinite(seconds) && seconds > 0
-      ? { state: "present", value: String(seconds) }
-      : { state: "unknown" };
+    const seconds = parseDarwinLstart(output, new Date().getFullYear());
+    return seconds === undefined ? { state: "unknown" } : { state: "present", value: String(seconds) };
   }
   try {
     const line = readFileSync(`/proc/${pid}/stat`, "utf8");
