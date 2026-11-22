@@ -132,6 +132,16 @@ writes into it — and points the model at its own worktree. Read-only inspectio
 and `git worktree` management stay allowed; production-ops sessions set
 `PI_ENG_PRIMARY=1` before starting.
 
+Two teardown rules follow from that, both learned the expensive way. Retiring a
+merged branch (`git -C <primary> branch -D <name>`) is allowed from a session in
+its own worktree when the delete provably loses nothing — ancestry, patch ids,
+or a landing commit that names the pull request it folded (a squash merge has no
+ancestry or patch-id evidence to give, and `git cherry` reporting `+` is what
+that merge looks like). And never `git worktree remove` the directory your own
+session is running in: the harness refuses every later command with `Working
+directory does not exist`, and the session cannot even `cd` out — remove it from
+somewhere else, once the session is elsewhere or finished.
+
     git worktree add ../pi-engineering-runtime-<topic> -b <branch> origin/main
 
 Symlink `node_modules` into the new worktree rather than reinstalling. The
