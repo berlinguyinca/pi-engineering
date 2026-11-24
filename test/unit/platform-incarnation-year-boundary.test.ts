@@ -72,8 +72,59 @@ test("unparseable or out-of-range ps output yields no start time", () => {
     "Mon Dec 31 23:60:00 2026", // minute 60
     "Mon Dec 31 23:59:60 2026", // second 60
     "Xyz Nov 20 15:41:48 2026", // unknown weekday
+    "Tue Feb 31 09:01:02 2026", // day 31 of a 28-day month: Date would say 3 March
+    "Thu Apr 31 09:01:02 2026", // day 31 of a 30-day month
+    "Sun Feb 29 09:01:02 2026", // leap day in a non-leap year
   ];
   for (const text of junk) assert.equal(parseDarwinLstart(text, 2026), undefined, JSON.stringify(text));
+});
+
+test("ps pads a single-digit day with two spaces", () => {
+  assert.equal(parseDarwinLstart("Thu Nov  5 09:01:02 2026", 2026), epoch(2026, 10, 5, 9, 1, 2));
+  assert.equal(parseDarwinLstart("Thu Nov  5 09:01:02", 2026), epoch(2026, 10, 5, 9, 1, 2));
+  assert.equal(parseDarwinLstart("Thu Feb 29 09:01:02 2024", 2026), epoch(2024, 1, 29, 9, 1, 2), "a real leap day parses");
+});
+
+test("a leap-day birth recorded pre-fix in a non-leap probe year is year_ambiguous", () => {
+  // The pre-fix code rendered "Feb 29" into the probe's year; in 2025 `Date`
+  // squeezes that to 1 March, so the stored value and the canonical one do not
+  // even share a month. It is still the same process.
+  const legacy = String(epoch(2025, 1, 29, 9, 1, 2)); // 1 March 2025
+  const canonical = String(epoch(2024, 1, 29, 9, 1, 2)); // 29 February 2024
+  assert.notEqual(new Date(Number(legacy) * 1000).getMonth(), 1, "the squeeze must actually have happened");
+  assert.equal(compareDarwinStartTimes(legacy, canonical), "year_ambiguous");
+  assert.equal(compareDarwinStartTimes(canonical, legacy), "year_ambiguous");
+  assert.equal(startTimesMatch(legacy, canonical, "darwin"), true);
+  assert.equal(startTimesMatch(legacy, canonical, "linux"), false);
+  // Still reuse: a different instant that no pre-fix rendering could produce.
+  assert.equal(compareDarwinStartTimes(String(epoch(2024, 2, 1, 9, 1, 2)), canonical), "different", "1 March, same year");
+  assert.equal(compareDarwinStartTimes(String(epoch(2025, 1, 28, 9, 1, 2)), canonical), "different", "28 February");
+  assert.equal(compareDarwinStartTimes(String(epoch(2025, 1, 29, 9, 1, 3)), canonical), "different", "one second off");
+});
+
+test("the DST fall-back hour is the one-hour blind spot ps leaves", () => {
+  // Two instants 3600 s apart print as the same `lstart` text, and `Date`
+  // resolves that text to the first pass. Pinned to a zone that has the fold.
+  const previous = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  try {
+    const first = epoch(2026, 10, 1, 1, 30, 0);
+    const second = first + 3600;
+    assert.equal(new Date(first * 1000).getTimezoneOffset(), 420, "first pass is PDT");
+    assert.equal(new Date(second * 1000).getTimezoneOffset(), 480, "second pass is PST");
+    const render = (s: number): string => {
+      const d = new Date(s * 1000);
+      return `${d.getHours()}:${d.getMinutes()}:${d.getSeconds()} ${d.getMonth()}/${d.getDate()}/${d.getFullYear()}`;
+    };
+    assert.equal(render(first), render(second), "ps prints the same wall clock for both");
+    assert.equal(parseDarwinLstart("Sun Nov  1 01:30:00 2026", 2026), first, "the text resolves to the first pass");
+    // Same year, so the year tolerance does not apply: they compare as different
+    // instants, but a process from the second pass is *probed* as the first.
+    assert.equal(compareDarwinStartTimes(String(first), String(second)), "different");
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
 });
 
 test("year-shifted values are year_ambiguous, never reuse", () => {

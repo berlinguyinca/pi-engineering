@@ -7,9 +7,13 @@
  * — boot id plus the kernel's start time for that PID — and liveness compares
  * the recorded incarnation against the live one.
  *
- * On Linux the start time is field 22 of `/proc/<pid>/stat` (clock ticks since
- * boot). Elsewhere it is unavailable and liveness degrades to `kill(pid, 0)`,
- * which callers must combine with heartbeat age before reclaiming anything.
+ * The incarnation is probed by `src/platform/processIncarnation.ts`, which is
+ * platform-specific: on Linux the start time is field 22 of `/proc/<pid>/stat`
+ * (clock ticks since boot); on Darwin it is epoch seconds from `ps -o lstart=`,
+ * compared with a year tolerance for records written before the printed year
+ * was honoured. Where no incarnation can be read at all, liveness degrades to
+ * `kill(pid, 0)`, which callers must combine with heartbeat age before
+ * reclaiming anything.
  */
 import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
@@ -19,7 +23,12 @@ export interface ProcessIdentity {
   host: string;
   /** Kernel boot id; changes on every reboot. Null where unavailable. */
   bootId: string | null;
-  /** Clock ticks since boot at which the process started. Null where unavailable. */
+  /**
+   * When the process started, as a digit string in a platform-specific unit
+   * (Linux: clock ticks since boot; Darwin: epoch seconds). Compare only with
+   * `startTimesMatch` from `src/platform/processIncarnation.ts`, never by
+   * equality. Null where unavailable.
+   */
   processStartTime: string | null;
 }
 
