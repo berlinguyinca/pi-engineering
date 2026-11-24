@@ -15,12 +15,22 @@
  *   ps prints (see {@link parseDarwinLstart}), because the year a process began
  *   in is not something the probing clock gets to decide.
  *
- * One resolution limit, on Darwin only: `lstart` reports whole seconds, so a pid
- * reused within the same second as its predecessor is indistinguishable there,
- * while Linux `starttime` ticks (~10 ms) usually tell them apart. It is inherent
- * to `ps`, the only start-time source Node can reach without a native helper, so
- * it is stated rather than fixed — and it does not weaken the year rule, whose
- * only added ambiguity is a full year, which the boot id covers.
+ * Two resolution limits, on Darwin only, both inherent to `ps` — the only
+ * start-time source Node can reach without a native helper — so stated rather
+ * than fixed:
+ *
+ * - `lstart` reports whole seconds, so a pid reused within the same second as
+ *   its predecessor is indistinguishable there, while Linux `starttime` ticks
+ *   (~10 ms) usually tell them apart.
+ * - In the DST fall-back hour `ps` prints the same wall clock for two instants
+ *   3600 s apart, and `new Date(y, m, d, h, mi, s)` resolves both to the first
+ *   pass, so a pid reused exactly one hour after its predecessor on that night
+ *   is indistinguishable too.
+ *
+ * Neither weakens the year rule. Its own tolerance (see
+ * {@link compareDarwinStartTimes}) accepts a same-boot pid reused at the
+ * identical local month, day and hh:mm:ss in *any other year* — a window that
+ * is open for every record, not only pre-fix ones — and the boot id covers it.
  *
  * `src/platform/eventstore/fileLock.ts` and `src/runtime/isolation/processIdentity.ts`
  * both need this, and used to carry separate copies. The runtime copy was
@@ -93,6 +103,9 @@ export function parseDarwinLstart(output: string, probeYear: number): number | u
     return undefined;
   }
   const start = new Date(year, month, day, hours, minutes, seconds);
+  // "Feb 31" passes the range check; `Date` would hand back 3 March. A day the
+  // month does not have is corrupt output, not an instant.
+  if (start.getMonth() !== month || start.getDate() !== day) return undefined;
   const epoch = Math.floor(start.getTime() / 1000);
   return Number.isFinite(epoch) && epoch > 0 ? epoch : undefined;
 }
@@ -103,15 +116,35 @@ function epochSecondsOf(value: string): number | undefined {
 
 export type StartTimeComparison = "exact" | "year_ambiguous" | "different";
 
+/** What the pre-fix code wrote for `instant`'s wall clock when the probe ran in `year`. */
+function renderedInYear(instant: Date, year: number): number {
+  return Math.floor(
+    new Date(
+      year,
+      instant.getMonth(),
+      instant.getDate(),
+      instant.getHours(),
+      instant.getMinutes(),
+      instant.getSeconds(),
+    ).getTime() / 1000,
+  );
+}
+
 /**
  * Compare two Darwin incarnation values.
  *
- * `exact` is the normal answer. `year_ambiguous` means same month, day and clock
- * time in different years — the only shape a value written before the printed-year
- * fix can take against a probe after it, so it must never be read as PID reuse.
- * Year discrimination is not lost with it: both call sites check the boot id
- * first, and a pid reused at the identical second of a different year on a
- * machine that never rebooted is a coincidence the boot id already covers.
+ * `exact` is the normal answer. `year_ambiguous` means one value is what the
+ * pre-fix code — same wall clock, the *probe's* year — would have written for
+ * the other, so it must never be read as PID reuse. Usually that is the same
+ * month, day and clock time in a different year, but the test is the rendering
+ * itself, not the fields: a 29 February birth rendered into a non-leap probe
+ * year was squeezed by `Date` to 1 March and does not even share a month with
+ * the canonical value, and it is still the same process.
+ *
+ * The tolerance is permanent — every record is compared this way, not only
+ * pre-fix ones — so the window it opens is a pid reused at the identical local
+ * month, day and hh:mm:ss in any other year on a machine that never rebooted.
+ * Both call sites check the boot id first, which covers that coincidence.
  */
 export function compareDarwinStartTimes(stored: string, probed: string): StartTimeComparison {
   if (stored === probed) return "exact";
@@ -120,13 +153,16 @@ export function compareDarwinStartTimes(stored: string, probed: string): StartTi
   if (a === undefined || b === undefined) return "different";
   const left = new Date(a * 1000);
   const right = new Date(b * 1000);
+  if (left.getFullYear() === right.getFullYear()) return "different";
   const sameWallClock =
     left.getMonth() === right.getMonth() &&
     left.getDate() === right.getDate() &&
     left.getHours() === right.getHours() &&
     left.getMinutes() === right.getMinutes() &&
     left.getSeconds() === right.getSeconds();
-  return sameWallClock && left.getFullYear() !== right.getFullYear() ? "year_ambiguous" : "different";
+  const oneIsTheOtherRendered =
+    renderedInYear(right, left.getFullYear()) === a || renderedInYear(left, right.getFullYear()) === b;
+  return sameWallClock || oneIsTheOtherRendered ? "year_ambiguous" : "different";
 }
 
 /**
