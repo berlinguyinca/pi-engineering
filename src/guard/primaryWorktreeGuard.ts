@@ -746,6 +746,65 @@ function pathValue(raw: string): string {
   return text.replace(/^[(('"`!]+/, "").replace(/[,'"`)\]:;]+$/, "");
 }
 
+/**
+ * The directories a `git worktree remove …` in this segment names, resolved against where the
+ * segment runs. Words this process cannot place (`$WT`, a glob) are skipped: `worktree` is an
+ * allowed verb here, so an unresolvable argument must not refuse the command outright — it just
+ * cannot be proved to be the session's own directory.
+ */
+function worktreeRemovalTargets(segment: string, runCwd: string, env: NodeJS.ProcessEnv): string[] {
+  const tokens = tokenize(segment);
+  const targets: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const word = tokens[i];
+    if (word === undefined || !isGitCommand(word)) continue;
+    let j = i + 1;
+    while (j < tokens.length && (tokens[j] ?? "").startsWith("-")) j += GIT_FLAGS_WITH_ARG.has(tokens[j] ?? "") ? 2 : 1;
+    if (tokens[j] !== "worktree") continue;
+    let k = j + 1;
+    while (k < tokens.length && (tokens[k] ?? "").startsWith("-")) k += 1;
+    if (tokens[k] !== "remove") continue;
+    for (const rest of tokens.slice(k + 1)) {
+      const value = pathValue(rest);
+      if (value.length === 0 || value.startsWith("-") || value.includes("$") || value.includes("*")) continue;
+      targets.push(resolveWriteTarget(value, runCwd, env));
+    }
+    i = k;
+  }
+  return targets;
+}
+
+/**
+ * Whether `inner` is `outer` itself or lives inside it.
+ *
+ * The direction is the whole point at the one call site, so the parameters say it: a removal
+ * strands a session when the session's own directory is the thing removed or sits inside it -
+ * removing `<worktree>` while the shell stands in `<worktree>/build` takes the directory out from
+ * under the session exactly as removing the directory it is in. The reverse test ("the target is
+ * inside the session directory") was what this used to compute, and it let the stranding case
+ * through while refusing removals of scratch subdirectories that strand nothing.
+ */
+function pathContains(outer: string, inner: string): boolean {
+  const outerPath = canonical(outer);
+  const innerPath = canonical(inner);
+  return innerPath === outerPath || innerPath.startsWith(`${outerPath}/`);
+}
+
+function selfWorktreeRemovalReason(segment: string, target: string, sessionCwd: string): string {
+  return [
+    "Blocked: this session cannot remove the worktree it is running in.",
+    `Culprit segment: \`${segment}\` — it removes \`${target}\`, which is (or contains) ${sessionCwd}, the`,
+    "directory this session runs in.",
+    "A session whose working directory disappears cannot run another command: the next tool call fails with",
+    "`Working directory does not exist`, and it cannot even `cd` out to fix that — the dead end observed when",
+    "a session retired its own worktree and then could not report what it had done.",
+    `Remove it from a directory that is not inside it (\`git worktree remove ${target}\` run elsewhere), or leave`,
+    "it for the operator. To give this session somewhere else to live first, `git worktree add <sibling-dir>",
+    "-b <branch> origin/<base>` is allowed here. If this really must happen from inside, restart the session",
+    "with PI_ENG_WORKTREE_GUARD=0.",
+  ].join("\n");
+}
+
 /** The directory the `git` in ONE segment of a compound command runs in. */
 function segmentGitCwd(
   segment: string,
@@ -869,57 +928,185 @@ async function gitOutput(cwd: string, args: string[]): Promise<string> {
   return r.code === 0 ? r.stdout.trim() : "";
 }
 
+/** What a successful no-loss proof rested on, in the order the proofs are tried. */
+type LandedBy = "ancestry" | "patch-id" | "squash-commit";
+
+interface NoLossVerdict {
+  ok: boolean;
+  /** The proof that held, when one did. */
+  by?: LandedBy;
+  /** Why nothing held, naming what was actually looked at. Empty when `ok`. */
+  why?: string;
+}
+
+/** How far back into the base's new commits the landed-commit search looks, and how wide a branch it will diff. */
+const PROOF_CANDIDATE_CAP = 60;
+const PROOF_PATH_CAP = 200;
+
 /**
- * True when none of `shas` (branches `names`, resolved by the caller) holds a
- * commit the base lacks, and none of `names` is checked out in a worktree.
- *
- * Two proofs, either one enough, against every base the repo offers (its HEAD,
- * `origin/HEAD`, `main`): ancestry (`rev-list --count <sha>^<base>` is 0) and
- * patch equivalence (`git cherry <base> <sha>` reports nothing new). Ancestry
- * alone is not enough — a squash merge leaves the branch's own commits ahead of
- * the base while its content is entirely in it, which is the shape a merged
- * session branch is left in.
+ * The pull request a merge commit folded in, the way GitHub writes it: the subject ends
+ * `Title (#884)` and a `Link:` trailer names `/pull/884`. Both spellings are accepted; a commit
+ * that names no PR is not evidence of a merge, only a commit with a message.
  */
-async function mergedIntoBase(names: string[], shas: string[], root: string): Promise<boolean> {
+function pullNumbers(subject: string): string[] {
+  const numbers = new Set<string>();
+  for (const match of subject.matchAll(/\(#(\d+)\)/gu)) if (match[1]) numbers.add(match[1]);
+  for (const match of subject.matchAll(/\/pull\/(\d+)\b/gu)) if (match[1]) numbers.add(match[1]);
+  return [...numbers];
+}
+
+/**
+ * Whether `sha` was folded into `base` by a squash merge — the one merge shape that leaves every
+ * commit of the branch ahead of the base (`git rev-list --count`) and every patch-id unmatched
+ * (`git cherry` reporting `+`), so ancestry and patch equivalence cannot prove it at all (#935).
+ *
+ * The proof is the merge commit itself: a commit the base gained since the branch forked, whose
+ * subject names a pull request, and whose content for every path the branch touched equals the
+ * branch's. The PR marker is load-bearing. Content alone would wave through a branch that gained
+ * an empty commit, or any branch whose files happen to match — content cannot see a commit that
+ * changes nothing, so it cannot carry "nothing is left behind" on its own.
+ *
+ * When the repository holds `refs/pull/<n>/head` (fetched by the usual GitHub refspec), it must
+ * name this exact commit, which ties the merge commit to the branch being deleted rather than to
+ * some earlier state of it.
+ */
+async function squashLanded(
+  sha: string,
+  base: string,
+  root: string,
+): Promise<{ landed: boolean; by?: LandedBy; detail: string }> {
+  const mergeBase = await gitOutput(root, ["merge-base", base, sha]);
+  if (!mergeBase) return { landed: false, detail: "it shares no merge-base with the base" };
+  const paths = (await gitOutput(root, ["diff", "--name-only", mergeBase, sha]))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (paths.length === 0) return { landed: false, detail: "it contributes no content of its own to compare" };
+  if (paths.length > PROOF_PATH_CAP)
+    return { landed: false, detail: `it touched ${paths.length} paths, too many to diff on a delete check` };
+
+  const candidates = (await gitOutput(root, ["log", "--format=%H\t%s", `${mergeBase}..${base}`]))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  // Newest first, which is the order `git log` already prints: the commit a branch landed in is
+  // normally among the most recent, and it is the newest match that gets checked first. Taking
+  // `slice(-CAP)` here kept the OLDEST candidates and dropped the landing commit on any base that
+  // had gained more than CAP commits since the branch point - the busy-repository case this proof
+  // exists for.
+  const newestFirst = candidates.slice(0, PROOF_CANDIDATE_CAP);
+  for (const line of newestFirst) {
+    const tab = line.indexOf("\t");
+    const commit = line.slice(0, tab);
+    const numbers = pullNumbers(line.slice(tab + 1));
+    if (numbers.length === 0) continue;
+    if ((await gitOutput(root, ["diff", "--name-only", sha, commit, "--", ...paths])) !== "") continue;
+    // A PR ref naming a different commit means the PR moved on; this merge commit is
+    // not the landing of what is being deleted.
+    const heads = await Promise.all(
+      numbers.map((n) => gitOutput(root, ["rev-parse", "--verify", "--quiet", `refs/pull/${n}/head`])),
+    );
+    const checked = heads.filter((head) => head !== "");
+    if (checked.length > 0 && !checked.includes(sha)) continue;
+    return {
+      landed: true,
+      by: "squash-commit",
+      detail: `base commit ${commit.slice(0, 8)} (PR ${numbers.join("/")}) carries it`,
+    };
+  }
+  return { landed: false, detail: "no commit the base gained names a pull request whose content matches it" };
+}
+
+/**
+ * The no-loss decision a branch delete needs, with the reason a refusal has to state.
+ *
+ * Three proofs, either one enough, against every base the repo offers (its HEAD, `origin/HEAD`,
+ * `main`): ancestry (`rev-list --count <sha>^<base>` is 0), patch equivalence (`git cherry <base>
+ * <sha>` reports nothing new), and the landing commit (`squashLanded`). The third is the one a squash-merged
+ * branch can pass: folding several commits into one leaves every commit of the branch ahead of the
+ * base and every patch-id unmatched, so the first two cannot succeed for that shape of merge at all
+ * — `git cherry` reporting `+` for every commit is not evidence of unmerged work, it is what a
+ * squash merge looks like (#935).
+ */
+async function noLossProof(names: string[], shas: string[], root: string): Promise<NoLossVerdict> {
   const listed = await gitOutput(root, ["worktree", "list", "--porcelain"]);
-  const checkedOut = new Set(
-    listed
-      .split("\n")
-      .filter((line) => line.startsWith("branch "))
-      .map((line) => line.slice("branch ".length).trim()),
-  );
-  for (const name of names) if (checkedOut.has(`refs/heads/${name}`)) return false;
+  const checkedOutIn = new Map<string, string>();
+  let directory = "";
+  for (const line of listed.split("\n")) {
+    if (line.startsWith("worktree ")) directory = line.slice("worktree ".length).trim();
+    else if (line.startsWith("branch ")) checkedOutIn.set(line.slice("branch ".length).trim(), directory);
+  }
+  for (const name of names) {
+    const where = checkedOutIn.get(`refs/heads/${name}`);
+    if (where) {
+      return {
+        ok: false,
+        why: [
+          `'${name}' is checked out in ${where}.`,
+          `Remove that worktree first ('git worktree remove ${where}'), and if that directory is this`,
+          "session's own cwd, move out of it before removing it — a session whose working directory",
+          "disappears cannot run another command.",
+        ].join(" "),
+      };
+    }
+  }
 
   const bases = new Set<string>();
   for (const ref of ["HEAD", "origin/HEAD", "origin/main", "main"]) {
     const sha = await gitOutput(root, ["rev-parse", "--verify", "--quiet", ref]);
     if (sha) bases.add(sha);
   }
-  if (bases.size === 0) return false;
+  if (bases.size === 0) return { ok: false, why: "the repository offers no base to prove against" };
 
   for (const sha of shas) {
-    let merged = false;
+    let by: LandedBy | undefined;
+    let cherry: string[] = [];
+    let detail = "";
     for (const base of bases) {
       // `<sha> ^<base>` as TWO arguments: `<sha>^<base>` is git's parent syntax
       // ("the first parent of sha, named base"), which fails as an unknown
       // revision and would read as "not merged".
       if ((await gitOutput(root, ["rev-list", "--count", sha, `^${base}`])) === "0") {
-        merged = true;
+        by = "ancestry";
         break;
       }
-      const cherry = (await gitOutput(root, ["cherry", base, sha]))
+      cherry = (await gitOutput(root, ["cherry", base, sha]))
         .split("\n")
         .map((line) => line.trim())
         .filter(Boolean);
       // `- <sha>`: already upstream, patch-equivalent. `+ <sha>`: not.
       if (cherry.length > 0 && cherry.every((line) => line.startsWith("-"))) {
-        merged = true;
+        by = "patch-id";
         break;
       }
+      const squash = await squashLanded(sha, base, root);
+      if (squash.landed) {
+        by = squash.by;
+        detail = squash.detail;
+        break;
+      }
+      detail = squash.detail || detail;
     }
-    if (!merged) return false;
+    if (!by) {
+      const ahead = Math.max(
+        0,
+        ...(await Promise.all(
+          [...bases].map(async (base) =>
+            Number((await gitOutput(root, ["rev-list", "--count", sha, `^${base}`])) || 0),
+          ),
+        )),
+      );
+      return {
+        ok: false,
+        why: [
+          `nothing proves it landed: ${ahead} commit${ahead === 1 ? "" : "s"} of it is not reachable from the`,
+          "base, `git cherry` reports `+` (patch ids do not match, which is the normal shape of a squash",
+          `merge), and ${detail || "its landing commit could not be found"}.`,
+        ].join(" "),
+      };
+    }
   }
-  return true;
+  return { ok: true, why: "" };
 }
 
 /**
@@ -993,7 +1180,7 @@ function unresolvedPathReason(segment: string): string {
 export class PrimaryWorktreeGuard {
   private readonly cache = new Map<string, WorktreeCheck | Promise<WorktreeCheck>>();
   /** No-loss branch-delete verdicts, keyed by root + names + resolved shas. */
-  private readonly teardown = new Map<string, Promise<boolean>>();
+  private readonly teardown = new Map<string, Promise<NoLossVerdict>>();
   private readonly sessionCwd: string | (() => string);
   private readonly config: PrimaryWorktreeGuardConfig;
   private readonly options: PrimaryWorktreeGuardOptions;
@@ -1063,21 +1250,30 @@ export class PrimaryWorktreeGuard {
   }
 
   /**
-   * True when `segment` is a plain `git branch -d|-D <name>…` whose branches are
-   * provably safe to delete: local refs, not checked out anywhere, with nothing
-   * the base lacks. This is the convention's end-of-life step — merge, then
-   * clean up the branch you created — which had no in-session route at all
-   * beyond restarting with PI_ENG_PRIMARY=1.
+   * The verdict for `segment`: ok when it is a plain `git branch -d|-D <name>…` of local branches
+   * that are provably safe to delete — not checked out anywhere, with nothing the base lacks. This
+   * is the convention's end-of-life step — merge, then clean up the branch you created — which had
+   * no in-session route at all beyond restarting with PI_ENG_PRIMARY=1. When it refuses, `why` says
+   * what was checked, because "it might be unmerged" is not an answer for a branch the base
+   * absorbed by squash (#935).
    */
-  private async deletesMergedBranchOnly(root: string, segment: string): Promise<boolean> {
+  private async deletesMergedBranchOnly(root: string, segment: string): Promise<NoLossVerdict> {
     const names = branchDeleteNames(segment);
-    if (names.length === 0) return false;
+    if (names.length === 0)
+      return {
+        ok: false,
+        why: "this is not a plain `git branch -d|-D <name>` of local branches, the only delete shape allowed here",
+      };
     const shas: string[] = [];
     for (const name of names) {
       const sha = await gitOutput(root, ["rev-parse", "--verify", "--quiet", `refs/heads/${name}`]);
       // Not a local branch: a remote-tracking ref, a tag, or a typo. The
       // allowance is for the session's own branches, so refuse.
-      if (!sha) return false;
+      if (!sha)
+        return {
+          ok: false,
+          why: `'${name}' resolves to no local branch (already deleted, a remote-tracking ref, or a typo)`,
+        };
       shas.push(sha);
     }
     // Keyed by sha as well as name: a branch that was merged can gain commits
@@ -1085,7 +1281,7 @@ export class PrimaryWorktreeGuard {
     const key = `${root}\u0000${names.join(",")}\u0000${shas.join(",")}`;
     const cached = this.teardown.get(key);
     if (cached) return cached;
-    const verdict = mergedIntoBase(names, shas, root);
+    const verdict = noLossProof(names, shas, root);
     this.teardown.set(key, verdict);
     return verdict;
   }
@@ -1111,10 +1307,25 @@ export class PrimaryWorktreeGuard {
         const root = await this.primaryAt(dirname(target.abs));
         if (root) return { block: true, reason: blockReason(`the write target \`${target.target}\``, root) };
       }
+      // `git worktree remove` is management, not a mutation of a checkout, so it stays allowed
+      // here — with one exception (#935): removing the worktree the session is RUNNING in leaves
+      // the session with no directory, which the harness then refuses for every further command.
+      let runCwd = this.cwd();
+      for (const segment of parts) {
+        const run = segmentGitCwd(segment, runCwd, this.env());
+        runCwd = run.cwd;
+        if (run.unresolved) continue;
+        const self = worktreeRemovalTargets(segment, run.cwd, this.env()).find((target) =>
+          pathContains(target, this.cwd()),
+        );
+        if (self !== undefined) return { block: true, reason: selfWorktreeRemovalReason(segment, self, this.cwd()) };
+      }
       // Likewise each mutating invocation is judged where ITS segment runs: a
       // `git -C <primary> log` in the tail must not turn the session's own
       // `git push` into a primary-checkout mutation.
       let refusedDelete = false;
+      let deleteWhy = "";
+      let deleteNames: string[] = [];
       for (const location of mutatingGitLocations(command, this.cwd(), this.env())) {
         // A directory this process cannot expand is not a directory this guard
         // can clear — refuse on the unresolved path, and say exactly that.
@@ -1124,11 +1335,28 @@ export class PrimaryWorktreeGuard {
         const root = await this.primaryAt(location.cwd);
         if (!root) continue; // that segment runs where the session may work
         if (this.config.branchTeardown && location.verb === "branch") {
-          if (await this.deletesMergedBranchOnly(root, location.segment)) continue;
-          refusedDelete = branchDeleteNames(location.segment).length > 0;
+          const names = branchDeleteNames(location.segment);
+          if (names.length > 0) {
+            const verdict = await this.deletesMergedBranchOnly(root, location.segment);
+            if (verdict.ok) continue;
+            refusedDelete = true;
+            deleteWhy = verdict.why ?? "the proofs came back empty";
+            deleteNames = names;
+          }
         }
         const hint = refusedDelete
-          ? "A branch delete is allowed here only when it provably loses nothing: the branch must be a local ref, merged into the base (by ancestry or patch-equivalent), and not checked out in any worktree."
+          ? [
+              "A branch delete is allowed here only when it provably loses nothing: a local ref, not checked",
+              "out in any worktree, and landed in the base — by ancestry, by patch ids (`git cherry`, that is",
+              "patch-equivalent), or by its landing commit (a commit the base gained since the branch forked",
+              "whose subject names a pull request and whose content for every path the branch touched equals",
+              "the branch's, which is how a squash merge lands — the only shape a squash merge can satisfy,",
+              "since it leaves no ancestry and no matching patch id). It did not:",
+              deleteWhy,
+              `. When the proof lives outside this checkout, delete it from a worktree that holds it`,
+              `('git -C <its-worktree> branch -D ${deleteNames.join(" ")}') — the guard protects only the`,
+              "primary checkout, so that route stays open from there.",
+            ].join(" ")
           : await this.sessionHint();
         return { block: true, reason: blockReason("this git command", root, location, hint) };
       }

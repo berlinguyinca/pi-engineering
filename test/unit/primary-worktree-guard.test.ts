@@ -721,6 +721,226 @@ test("guard: an unmerged branch delete stays blocked, and says what would make i
   }
 });
 
+/**
+ * The shape issue #935 actually hit: several commits, folded into the base by one squash commit
+ * naming the pull request (`Title (#884)`, what GitHub writes), so every one of the branch's own
+ * commits is ahead of the base AND `git cherry` reports `+` for all of them. `git merge --squash`
+ * of a single commit happens to produce a patch-id the older proofs recognise; a multi-commit
+ * branch does not, which is why the gap went unnoticed.
+ */
+async function repoWithSquashedSessionBranch(subject = "Some feature (#884)"): Promise<{
+  primary: string;
+  linked: string;
+  cleanup: () => void;
+}> {
+  const repo = await scratchRepoWithWorktree();
+  for (const [name, body] of [
+    ["feat.md", "first\n"],
+    ["notes.md", "second\n"],
+  ] as const) {
+    writeFileSync(join(repo.linked, name), body);
+    await exec("git", ["-C", repo.linked, "add", "-A"]);
+    await exec("git", ["-C", repo.linked, "commit", "-qm", name]);
+  }
+  await exec("git", ["-C", repo.primary, "merge", "--squash", "feat/x"]);
+  await exec("git", ["-C", repo.primary, "commit", "-qm", subject]);
+  return repo;
+}
+
+test("#935 guard: a multi-commit squash merge is provable by content, not only by patch ids", async () => {
+  const { primary, linked, cleanup } = await repoWithSquashedSessionBranch();
+  try {
+    // The old proofs, on the real repository: ancestry says two commits are ahead, and patch ids
+    // say every one of them is new. Without a content proof this delete has no route at all.
+    const ahead = await exec("git", ["-C", primary, "rev-list", "--count", "feat/x", "^HEAD"]);
+    assert.equal(ahead.stdout.trim(), "2");
+    const cherry = await exec("git", ["-C", primary, "cherry", "HEAD", "feat/x"]);
+    assert.match(cherry.stdout, /^\+/mu, "a squash merge leaves every branch commit looking new");
+
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+    const stranded = new PrimaryWorktreeGuard(linked);
+    assert.equal(
+      await stranded.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` }),
+      undefined,
+      "the branch's content is identical to main for every path it touched",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("#935 guard: a squash merge later PRs moved on from is proved by the commit it landed in", async () => {
+  const { primary, linked, cleanup } = await repoWithSquashedSessionBranch();
+  try {
+    // Another change to the same file after the squash: comparing the branch against the TIP of
+    // the base now says "different", which is true of the base and nothing to do with whether the
+    // branch landed.
+    writeFileSync(join(primary, "feat.md"), "first\nlater work\n");
+    await exec("git", ["-C", primary, "add", "-A"]);
+    await exec("git", ["-C", primary, "commit", "-qm", "later work"]);
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+
+    const tipDiff = await exec("git", ["-C", primary, "diff", "--name-only", "feat/x", "HEAD", "--", "feat.md"]);
+    assert.equal(tipDiff.stdout.trim(), "feat.md", "the tip comparison alone would refuse this");
+
+    const stranded = new PrimaryWorktreeGuard(linked);
+    assert.equal(
+      await stranded.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` }),
+      undefined,
+      "the squash commit still carries exactly what the branch had",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("#935 guard: a squash commit naming no pull request is a manual squash, and stays blocked", async () => {
+  // Content equality alone would wave this through. It cannot carry the guarantee on its own: a
+  // commit that changes nothing is invisible to it, so "nothing is left behind" has to rest on the
+  // landing commit naming the request it folded.
+  const { primary, linked, cleanup } = await repoWithSquashedSessionBranch("folded in by hand");
+  try {
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+    const guard = new PrimaryWorktreeGuard(linked);
+    const blocked = await guard.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` });
+    assert.equal(blocked?.block, true);
+    assert.match(blocked?.reason ?? "", /pull request/u);
+  } finally {
+    cleanup();
+  }
+});
+
+test("#935 guard: work the base does not have is refused, and the reason says what was tried", async () => {
+  const { primary, linked, cleanup } = await repoWithSquashedSessionBranch();
+  try {
+    // Committed after the squash: this content really is absent from main.
+    writeFileSync(join(linked, "unlanded.md"), "never merged\n");
+    await exec("git", ["-C", linked, "add", "-A"]);
+    await exec("git", ["-C", linked, "commit", "-qm", "after the squash"]);
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+
+    const guard = new PrimaryWorktreeGuard(linked);
+    const blocked = await guard.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` });
+    assert.equal(blocked?.block, true);
+    const reason = blocked?.reason ?? "";
+    assert.match(reason, /provably loses nothing/u);
+    assert.match(reason, /patch-equivalent/u);
+    // Not "it might be unmerged": the guard now knows which proofs it ran and what each said.
+    assert.match(reason, /git cherry/u);
+    assert.match(reason, /squash/u);
+    // And it names the route that works in-session instead of implying the operator must delete by hand.
+    assert.match(reason, /branch -D feat\/x/u);
+    assert.match(reason, /PI_ENG_PRIMARY/u);
+  } finally {
+    cleanup();
+  }
+});
+
+/**
+ * `main` gains `before` commits between the branch point and the squash, so the landing commit is
+ * the NEWEST thing in the range a delete has to search. A candidate window that keeps the wrong end
+ * of that range finds nothing on exactly this shape: a branch that lived while the base moved, the
+ * repository #935 was reported from.
+ */
+async function repoWithSquashAfterBaseMoves(
+  before: number,
+): Promise<{ primary: string; linked: string; cleanup: () => void }> {
+  const repo = await scratchRepoWithWorktree();
+  for (const [name, body] of [
+    ["feat.md", "first\n"],
+    ["notes.md", "second\n"],
+  ] as const) {
+    writeFileSync(join(repo.linked, name), body);
+    await exec("git", ["-C", repo.linked, "add", "-A"]);
+    await exec("git", ["-C", repo.linked, "commit", "-qm", name]);
+  }
+  for (let i = 0; i < before; i += 1) {
+    writeFileSync(join(repo.primary, `unrelated-${i}.md`), `${i}\n`);
+    await exec("git", ["-C", repo.primary, "add", "-A"]);
+    await exec("git", ["-C", repo.primary, "commit", "-qm", `base work ${i}`]);
+  }
+  await exec("git", ["-C", repo.primary, "merge", "--squash", "feat/x"]);
+  await exec("git", ["-C", repo.primary, "commit", "-qm", "Some feature (#884)"]);
+  return repo;
+}
+
+test("#935 guard: a landing commit is still found when the base moved far more than the candidate window", async () => {
+  const { primary, linked, cleanup } = await repoWithSquashAfterBaseMoves(90);
+  try {
+    await exec("git", ["-C", primary, "worktree", "remove", "--force", linked]);
+    const stranded = new PrimaryWorktreeGuard(linked);
+    assert.equal(
+      await stranded.onToolCall("bash", { command: `git -C ${primary} branch -D feat/x` }),
+      undefined,
+      "the squash commit is the newest thing the base gained, and the window has to reach it",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("#935 guard: removing a worktree that CONTAINS this session's directory is refused as well", async () => {
+  const { primary, linked, cleanup } = await scratchRepoWithWorktree();
+  try {
+    // A session rarely runs in the worktree root; it runs in a directory of it, and removing the
+    // worktree takes that directory with it.
+    const deep = join(linked, "build", "tmp");
+    mkdirSync(deep, { recursive: true });
+    const guard = new PrimaryWorktreeGuard(deep);
+    for (const command of [`git -C ${primary} worktree remove ${linked}`, `cd ${linked} && git worktree remove .`]) {
+      const blocked = await guard.onToolCall("bash", { command });
+      assert.equal(blocked?.block, true, command);
+      assert.match(blocked?.reason ?? "", /worktree it is running in/u, command);
+    }
+    // A removal that does not contain the session directory strands nothing, so it is not this
+    // rule's business.
+    const inside = join(linked, "scratch");
+    mkdirSync(inside, { recursive: true });
+    await exec("git", ["-C", primary, "worktree", "add", "-q", inside, "-b", "feat/inside"]);
+    assert.equal(
+      await guard.onToolCall("bash", { command: `git -C ${primary} worktree remove --force ${inside}` }),
+      undefined,
+      "the session directory itself survives this removal",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("#935 guard: removing the worktree this session runs in is refused, and says what to do instead", async () => {
+  const { primary, linked, cleanup } = await scratchRepoWithWorktree();
+  try {
+    const guard = new PrimaryWorktreeGuard(linked);
+    for (const command of [
+      `git -C ${primary} worktree remove ${linked}`,
+      `git -C ${primary} worktree remove --force ${linked}`,
+      `cd ${linked} && git worktree remove .`,
+    ]) {
+      const blocked = await guard.onToolCall("bash", { command });
+      assert.equal(blocked?.block, true, command);
+      assert.match(blocked?.reason ?? "", /worktree it is running in/u, command);
+      // The point of the message: a session whose directory disappears cannot
+      // even cd out of it — the exact dead end observed on 2026-08-09.
+      assert.match(blocked?.reason ?? "", /cannot run/u, command);
+      assert.match(blocked?.reason ?? "", /from a directory that is not inside it/u, command);
+    }
+
+    // Removing some OTHER worktree stays allowed: the guard protects this session,
+    // not worktree management in general.
+    const other = join(primary, "../scratch-other");
+    await exec("git", ["-C", primary, "worktree", "add", "-q", other, "-b", "feat/other"]);
+    assert.equal(await guard.onToolCall("bash", { command: `git -C ${primary} worktree remove ${other}` }), undefined);
+    // And the same removal is fine from a session that is not living in it.
+    const elsewhere = new PrimaryWorktreeGuard(primary);
+    assert.equal(
+      await elsewhere.onToolCall("bash", { command: `git -C ${primary} worktree remove ${linked}` }),
+      undefined,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("guard: --git-dir does not route around the guard", async () => {
   const { primary, linked, cleanup } = await repoWithSessionBranch();
   try {

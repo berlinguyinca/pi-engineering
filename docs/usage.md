@@ -1126,7 +1126,12 @@ Read-only inspection (`git status`, `log`, `diff`, `show`, `fetch`, `ls-remote`,
 `cat-file`, `for-each-ref`, `rev-list`, `merge-base`, `reflog`, `grep`, a bare
 `git tag`, `git remote -v`, …) and worktree management (`git worktree
 add|remove|list|prune`) stay allowed — that is how a session observes the repo
-and **leaves** for its own worktree. A `branch`/`tag` command whose flags are
+and **leaves** for its own worktree — with one exception: `git worktree remove`
+of the directory the session is **running in** is refused. A session whose
+working directory disappears cannot run another command — every later shell
+call fails with `Working directory does not exist`, and it cannot even `cd` out
+— so the removal has to be done from a directory that is not inside it, after
+the session is elsewhere or finished. A `branch`/`tag` command whose flags are
 all listing filters (`--merged`, `--no-merged`, `--contains`, `--points-at`,
 `--show-current`, `--format`, `--sort`, `-a`, `-r`, `-v`, `-l`) lists, whatever
 words follow them — they are patterns, base refs, or flag values; a flag this
@@ -1153,12 +1158,23 @@ Knobs (set before starting the session):
   happen in the production tree).
 - `PI_ENG_WORKTREE_GUARD=0` — disable the guard entirely.
 - `PI_ENG_BRANCH_TEARDOWN=0` — also refuse the one state change the guard
-  allows on proof: deleting a **local branch** that is merged into the base
-  (by ancestry or patch-equivalent, so a squash-merge counts) and checked out
-  in no worktree. That is the convention's end-of-life step — merge, then clean
-  up the branch you created — which had no in-session route at all beyond
-  restarting with `PI_ENG_PRIMARY=1`. Any name in the delete that fails the
-  proof blocks the whole command.
+  allows on proof: deleting a **local branch** that is merged into the base and
+  checked out in no worktree. That is the convention's end-of-life step — merge,
+  then clean up the branch you created — which had no in-session route at all
+  beyond restarting with `PI_ENG_PRIMARY=1`. Landing is proved three ways:
+  ancestry (nothing of the branch is unreachable from the base), patch ids
+  (`git cherry` reports nothing new), or the **landing commit** — a commit the
+  base gained since the branch forked whose subject names a pull request and
+  whose content for every path the branch touched equals the branch's
+  (`Title (#884)`, what a squash merge writes). The third is the only proof a
+  squash merge can satisfy at all: folding several commits into one leaves every
+  commit of the branch ahead of the base and every patch-id unmatched, so `git
+  cherry` reporting `+` is what that merge looks like, not evidence of unmerged
+  work. Content alone is not accepted — it cannot see a commit that changes
+  nothing, so it cannot carry "nothing is left behind" by itself — which is why
+  the landing commit has to name the request it folded. Any name in the delete
+  that fails the proof blocks the whole command, and the reason says which
+  proofs ran and what each found.
 
 The bash checks are best-effort (no full shell parsing); an unrecognized
 mutating form is a gap to close when it bites, not a contract hole. `git -C`,
