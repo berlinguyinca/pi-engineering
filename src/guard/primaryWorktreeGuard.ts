@@ -774,11 +774,20 @@ function worktreeRemovalTargets(segment: string, runCwd: string, env: NodeJS.Pro
   return targets;
 }
 
-/** Whether `target` is `dir` itself or something inside it. */
-function containsDirectory(target: string, dir: string): boolean {
-  const outer = canonical(target);
-  const inner = canonical(dir);
-  return outer === inner || outer.startsWith(`${inner}/`);
+/**
+ * Whether `inner` is `outer` itself or lives inside it.
+ *
+ * The direction is the whole point at the one call site, so the parameters say it: a removal
+ * strands a session when the session's own directory is the thing removed or sits inside it -
+ * removing `<worktree>` while the shell stands in `<worktree>/build` takes the directory out from
+ * under the session exactly as removing the directory it is in. The reverse test ("the target is
+ * inside the session directory") was what this used to compute, and it let the stranding case
+ * through while refusing removals of scratch subdirectories that strand nothing.
+ */
+function pathContains(outer: string, inner: string): boolean {
+  const outerPath = canonical(outer);
+  const innerPath = canonical(inner);
+  return innerPath === outerPath || innerPath.startsWith(`${outerPath}/`);
 }
 
 function selfWorktreeRemovalReason(segment: string, target: string, sessionCwd: string): string {
@@ -979,11 +988,14 @@ async function squashLanded(
   const candidates = (await gitOutput(root, ["log", "--format=%H\t%s", `${mergeBase}..${base}`]))
     .split("\n")
     .map((line) => line.trim())
-    .filter(Boolean)
-    // Newest first: the commit a branch landed in is normally among the most recent.
-    .slice(-PROOF_CANDIDATE_CAP)
-    .reverse();
-  for (const line of candidates) {
+    .filter(Boolean);
+  // Newest first, which is the order `git log` already prints: the commit a branch landed in is
+  // normally among the most recent, and it is the newest match that gets checked first. Taking
+  // `slice(-CAP)` here kept the OLDEST candidates and dropped the landing commit on any base that
+  // had gained more than CAP commits since the branch point - the busy-repository case this proof
+  // exists for.
+  const newestFirst = candidates.slice(0, PROOF_CANDIDATE_CAP);
+  for (const line of newestFirst) {
     const tab = line.indexOf("\t");
     const commit = line.slice(0, tab);
     const numbers = pullNumbers(line.slice(tab + 1));
@@ -1304,7 +1316,7 @@ export class PrimaryWorktreeGuard {
         runCwd = run.cwd;
         if (run.unresolved) continue;
         const self = worktreeRemovalTargets(segment, run.cwd, this.env()).find((target) =>
-          containsDirectory(target, this.cwd()),
+          pathContains(target, this.cwd()),
         );
         if (self !== undefined) return { block: true, reason: selfWorktreeRemovalReason(segment, self, this.cwd()) };
       }
